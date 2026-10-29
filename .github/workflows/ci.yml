@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pinned images and architectures: ubuntu-24.04 is x86_64 (OpenBLAS), macos-26 is arm64
+        # (Apple silicon, Accelerate; what macos-latest meant in 2026-10). A ranking must be the
+        # same bits on both (tests/test_canonical_scores.py).
+        os: [ubuntu-24.04, macos-26]
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install (locked)
+        run: uv sync --frozen --all-extras
+      - name: Platform (architecture, numpy build, BLAS, CPU features)
+        run: uv run python -c "import platform, numpy; print(platform.platform(), platform.machine()); numpy.show_config()"
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: Test (no network; backend tests skip without their DSN; 256 open files)
+        run: |
+          # macOS's default limit: the suite runs within it on every runner (0.1.0, parent PUB-4)
+          ulimit -n 256
+          uv run pytest -q
+      - name: Build and check the distributions
+        run: |
+          uv build
+          uv run python scripts/check_dist.py dist/*.whl dist/*.tar.gz
+
+  backends:
+    # The real-backend tests (PostgreSQL state store, pgvector, Qdrant) skip without a DSN; here
+    # they run against service containers (Linux runners only). 0.1.0, parent PUB-2.
+    name: real backends (ubuntu-24.04, PostgreSQL 16 + pgvector, Qdrant)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: rvg
+          POSTGRES_PASSWORD: rvg
+          POSTGRES_DB: rvg
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U rvg -d rvg"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+      qdrant:
+        image: qdrant/qdrant:v1.19.1
+        ports: ["6333:6333"]
+    env:
+      DEEPJEV_TEST_POSTGRES_DSN: postgresql://rvg:rvg@127.0.0.1:5432/rvg
+      DEEPJEV_TEST_PGVECTOR_DSN: postgresql://rvg:rvg@127.0.0.1:5432/rvg
+      DEEPJEV_TEST_QDRANT_URL: http://127.0.0.1:6333
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.12"
+      - name: Install (locked)
+        run: uv sync --frozen --all-extras
+      - name: Wait for Qdrant
+        run: |
+          for _ in $(seq 1 60); do curl -fsS http://127.0.0.1:6333/ >/dev/null && exit 0; sleep 1; done
+          echo "Qdrant did not start"; exit 1
+      - name: Test with the real backends (256 open files)
+        run: |
+          ulimit -n 256
+          uv run pytest -q
+

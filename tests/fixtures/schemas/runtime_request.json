@@ -1,0 +1,14 @@
+{
+  "request_id": "fixture-request-001",
+  "tenant_id": "fixture-tenant",
+  "principal_id": "fixture-principal",
+  "question": "기준 시점에 적용되는 한도는 무엇인가?",
+  "locale": "ko-KR",
+  "as_of": "2026-09-24T00:00:00Z",
+  "freshness_mode": "as_of_snapshot",
+  "context": {
+    "selected_document_ids": [
+      "fixture-doc"
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rvg:runtime-api:0.1:event_result",
+  "title": "RuntimeSession.apply_event result",
+  "description": "APPLIED: the state changed. DUPLICATE: it already was as the event asks (judged by content), or the same event id arrived again with the same payload (reason event_id_replayed; the recorded result is returned). REJECTED: a rule refused it and nothing changed. ERROR: the backend failed and the event's transaction rolled back. The same event id with another payload is an operation error (event_id_conflict).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_version", "operation", "event_id", "type", "outcome", "reason", "event_seq", "knowledge_seq", "access", "readiness"],
+  "properties": {
+    "api_version": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/api_version"},
+    "operation": {"const": "apply_event"},
+    "event_id": {"type": ["string", "null"]},
+    "type": {"enum": ["revision", "revoke", "access"]},
+    "outcome": {"enum": ["APPLIED", "DUPLICATE", "REJECTED", "ERROR"]},
+    "reason": {"type": ["string", "null"]},
+    "event_seq": {"type": ["integer", "null"]},
+    "knowledge_seq": {"type": "integer", "minimum": 0},
+    "access": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/access_change"},
+    "readiness": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/readiness_set"}
+  }
+}

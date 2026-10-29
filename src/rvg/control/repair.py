@@ -1,0 +1,92 @@
+from __future__ import annotations
+
+from pydantic import Field
+
+from ..contracts import Contract
+from ..grounded.engine import align_quote
+from ..prompts import prompt
+from ..providers.generation import GenerationOptions, GenerationRequest, strict_schema
+from ..temporal.models import AnswerDraft, AnswerSentence
+
+SENTENCE_LIMIT = next(
+    m.max_length for m in AnswerSentence.model_fields["text"].metadata if hasattr(m, "max_length")
+)
+
+
+class Rewrite(Contract):
+    sentence_index: int = Field(ge=0)
+    evidence_id: str = Field(min_length=1)
+    quote: str = Field(min_length=1, max_length=1600)
+
+
+class Rewrites(Contract):
+    rewrites: tuple[Rewrite, ...] = Field(max_length=8)
+
+
+async def rewrite_extractive(generator, question, evidence, draft, failed, context):
+    """Replace failed sentences by exact evidence units; paraphrased quotes are rejected."""
+    schema = strict_schema(Rewrites)
+    properties = schema["$defs"]["Rewrite"]["properties"]
+    properties["sentence_index"]["enum"] = sorted(failed)
+    properties["evidence_id"]["enum"] = [e["id"] for e in evidence]
+    result = await generator.generate_structured(
+        GenerationRequest(
+            role="semantic",
+            system=prompt("control.repair.rewrite_extractive.system"),
+            payload={
+                "question": question.model_dump(mode="json")
+                if hasattr(question, "model_dump")
+                else question,
+                "evidence": [
+                    {"id": e["id"], "title": e.get("title", ""), "text": e["text"]}
+                    for e in evidence
+                ],
+                "draft": draft,
+                "failed_sentence_indexes": sorted(failed),
+            },
+            response_type=Rewrites,
+            schema_name="control_rewrites_v1",
+            prompt_version="control-rewrite-1",
+            options=GenerationOptions(max_tokens=1600),
+            schema_override=schema,
+        ),
+        context,
+    )
+    by_id = {e["id"]: e for e in evidence}
+    replaced, rejected = {}, []
+    for item in result.value.rewrites:
+        unit = by_id.get(item.evidence_id)
+        if (
+            item.sentence_index not in failed
+            or item.sentence_index in replaced
+            or unit is None
+            or align_quote(unit["text"], item.quote) is None
+        ):
+            rejected.append(item.model_dump())
+            continue
+        # Ship the whole source unit so governing qualifiers stay attached to the value. A unit
+        # longer than a sentence may be (long prose paragraphs) cannot be shipped as one: then
+        # the sentence stays unrepaired rather than the draft becoming invalid.
+        if len(unit["text"]) > SENTENCE_LIMIT:
+            rejected.append({**item.model_dump(), "reason": "unit_longer_than_a_sentence"})
+            continue
+        replaced[item.sentence_index] = {"text": unit["text"], "evidence_ids": [unit["id"]]}
+    if not replaced:
+        return None, {"replaced": [], "rejected": rejected}
+    sentences = [
+        replaced.get(i, s)
+        for i, s in enumerate(draft["sentences"])
+        if i in replaced or i not in failed
+    ]
+    value = AnswerDraft.model_validate(
+        {
+            "answerable": True,
+            "short_answer": " ".join(s["text"] for s in sentences)[:1000],
+            "sentences": sentences,
+        }
+    )
+    return value, {
+        "replaced": sorted(replaced),
+        "rejected": rejected,
+        "dropped": sorted(set(failed) - set(replaced)),
+    }

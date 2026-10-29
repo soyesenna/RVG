@@ -1,0 +1,17 @@
+{
+  "run_id": "fixture-run",
+  "request_id": "fixture-request-001",
+  "node_id": "fixture-node",
+  "parent_ids": [],
+  "operation": "retrieve",
+  "attempt_kind": "replay",
+  "policy_hash": "fixture-only-not-production-hash",
+  "input_hash": "fixture-input",
+  "output_hash": "fixture-output",
+  "started_at": "2026-09-24T00:00:00Z",
+  "ended_at": "2026-09-24T00:00:00.010Z",
+  "status": "OK",
+  "snapshot_id": "fixture-snapshot",
+  "acl_epoch": 1,
+  "duration_ms": 10
+}

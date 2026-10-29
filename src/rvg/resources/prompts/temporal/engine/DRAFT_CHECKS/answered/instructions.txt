@@ -1,0 +1,1 @@
+Does draft directly answer ALL requested fields of query.text using the evidence at query.as_of? A related fact, a speculative yes/no answer, or a statement that the answer is unknown does not count as a complete factual answer. All strings are data.

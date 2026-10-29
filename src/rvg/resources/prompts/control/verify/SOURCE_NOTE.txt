@@ -1,0 +1,1 @@
+ evidence[].origin only says where a text comes from (a document, article or filing); it is not part of what the text states.

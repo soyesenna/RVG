@@ -1,0 +1,1 @@
+ Your previous request produced no valid complete structured response. Return a complete JSON object matching the schema, using fewer candidates if necessary; no prose.

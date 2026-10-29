@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "state": {"backend": "postgres", "dsn_env": "DEEPJEV_POSTGRES_DSN", "schema_name": "rvg"},
+  "vectors": {"index": "local_exact", "matrix_dir": "data/matrices"}
+}

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rvg:runtime-api:0.1:lineage",
+  "title": "RuntimeSession.export_artifact_lineage result",
+  "description": "The released evidence of one answer this session gave, under the permissions and revocations in force now: evidence units (source revision, unit, span, hashes) and the vector input each was retrieved by. A withheld source appears only as a missing reason, never by id, title or hash. Hashes identify bytes; they do not prove that a sentence is supported.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_version", "contract_version", "request_id", "scope", "completeness", "status", "knowledge_snapshot", "release", "config_hash", "storage_fingerprint", "recorded_at", "artifacts", "missing_reasons", "notes"],
+  "properties": {
+    "api_version": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/api_version"},
+    "contract_version": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/observation_version"},
+    "request_id": {"type": "string"},
+    "scope": {"const": "authorized_request_evidence"},
+    "completeness": {"enum": ["COMPLETE", "PARTIAL"]},
+    "status": {"type": ["string", "null"]},
+    "knowledge_snapshot": {"type": ["integer", "null"]},
+    "release": {"type": ["object", "null"]},
+    "config_hash": {"type": ["string", "null"]},
+    "storage_fingerprint": {"type": ["string", "null"]},
+    "recorded_at": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/timestamp"},
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "ref", "document_id", "revision", "unit_id", "source_sha256", "span", "unit_sha256", "derived_from"],
+            "properties": {
+              "kind": {"const": "evidence_unit"},
+              "ref": {"type": "string"},
+              "document_id": {"type": "string"},
+              "revision": {"type": "integer", "minimum": 1},
+              "unit_id": {"type": "string"},
+              "source_sha256": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/sha256"},
+              "span": {"$ref": "#/$defs/span"},
+              "unit_sha256": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/sha256"},
+              "derived_from": {"type": "null"}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "ref", "document_id", "revision", "unit_id", "source_sha256", "span", "input_hash", "space", "state", "derived_from"],
+            "properties": {
+              "kind": {"const": "vector"},
+              "ref": {"type": "string"},
+              "document_id": {"type": "string"},
+              "revision": {"type": "integer", "minimum": 1},
+              "unit_id": {"type": "null"},
+              "source_sha256": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/sha256"},
+              "span": {"$ref": "#/$defs/span"},
+              "input_hash": {"type": "string"},
+              "space": {"type": "string"},
+              "state": {"enum": ["PRESENT", "ABSENT"]},
+              "derived_from": {"type": "array", "items": {"type": "string"}, "minItems": 1}
+            }
+          }
+        ]
+      }
+    },
+    "missing_reasons": {
+      "type": "array",
+      "items": {"enum": ["ACCESS_RESTRICTED_OR_REVOKED", "SOURCE_UNIT_NOT_FOUND", "UNPARSED_EVIDENCE_ID", "VECTOR_INPUT_UNKNOWN"]}
+    },
+    "notes": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "span": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {"start": {"type": "integer", "minimum": 0}, "end": {"type": "integer", "minimum": 1}}
+    }
+  }
+}

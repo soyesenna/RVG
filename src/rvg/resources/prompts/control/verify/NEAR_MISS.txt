@@ -1,0 +1,1 @@
+answer names something connected to what question asks for but not the asked item itself: a person instead of that person's team or role, a current name where the former one is asked or the reverse, a part instead of the whole, a work instead of its creator, or an entity met on the way to the answer.

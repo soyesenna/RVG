@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "state": {"backend": "sqlite", "path": "data/temporal.sqlite3"},
+  "vectors": {"index": "local_exact", "matrix_dir": "beside"}
+}

@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rvg:runtime-api:0.1:handoff_packet",
+  "title": "Handoff packet (opt-in, handoff-v1)",
+  "description": "`result.handoff`: only on a result that was not released (ABSTAIN, UNRESOLVED_SCOPE, ERROR) of an engine or session opened with handoff_packet=True. It is not a release (`kind`, `released`) and never enters a release record or the lineage. A unit's text appears only when the requester may see that unit now (release check, deny list, selection, validity gate ELIGIBLE); every text a stage wrote is withheld when any unit that stage's writer saw is withheld. Flags are automatic.",
+  "type": "object",
+  "required": ["kind", "released", "version", "status", "reason", "reasons", "stages", "handed_draft", "comparison", "evidence", "flags", "premise"],
+  "properties": {
+    "kind": {"const": "handoff_draft"},
+    "released": {"const": false},
+    "version": {"const": "handoff-v1"},
+    "status": {"enum": ["ABSTAIN", "UNRESOLVED_SCOPE", "ERROR"]},
+    "reason": {"type": ["string", "null"]},
+    "reasons": {"type": "array", "items": {"type": "string"}},
+    "stages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "evidence_ids", "writer", "draft", "control", "status", "reason", "reasons"],
+        "properties": {
+          "stage": {"enum": ["stage1", "stage1_top1", "stage2", "partner_draft", "conflict_rewrite"]},
+          "evidence_ids": {"type": "array", "items": {"type": "string"}},
+          "writer": {
+            "type": ["object", "null"],
+            "required": ["refused", "refusal", "raw"],
+            "properties": {
+              "refused": {"type": "boolean"},
+              "refusal": {"enum": [null, "not_answerable", "no_sentences", "empty_short_answer", "citation_outside_evidence", "quotes_not_bound"]}
+            }
+          },
+          "draft": {"type": ["object", "null"]},
+          "control": {"type": ["object", "null"]},
+          "reasons": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "handed_draft": {"enum": ["stage2", "stage1", "stage1_top1", null]},
+    "comparison": {"type": ["object", "null"]},
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "gate"],
+        "oneOf": [
+          {"required": ["text"], "not": {"required": ["withheld"]}},
+          {"required": ["withheld"], "not": {"anyOf": [{"required": ["text"]}, {"required": ["title"]}]}}
+        ]
+      }
+    },
+    "flags": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "sentence", "kind", "detail", "automatic", "note"],
+        "properties": {
+          "kind": {"enum": ["claim_not_supported", "answered_below"]},
+          "sentence": {"type": ["integer", "null"]},
+          "automatic": {"const": true},
+          "note": {"type": "string"}
+        }
+      }
+    },
+    "premise": {"const": "not_checked"}
+  }
+}

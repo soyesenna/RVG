@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rvg:runtime-api:0.1:answer_envelope",
+  "title": "RuntimeSession.answer envelope",
+  "description": "`result` is UniversalEngine.answer's result unchanged (its own fields are the engine's; only the ones every result has are named here, and the opt-in handoff packet, which a released result never carries). `usage` counts this request's calls.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_version", "request_id", "result", "usage"],
+  "properties": {
+    "api_version": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/api_version"},
+    "request_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,160}$"},
+    "result": {
+      "type": "object",
+      "required": ["status", "as_of", "known_at", "snapshot", "config_hash", "storage", "audit"],
+      "properties": {
+        "status": {"enum": ["FULL", "PARTIAL", "ABSTAIN", "UNRESOLVED_SCOPE", "ERROR"]},
+        "config_hash": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/sha256"},
+        "snapshot": {"type": "integer", "minimum": 0},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "release": {"type": ["object", "null"]},
+        "handoff": {"$ref": "urn:rvg:runtime-api:0.1:handoff_packet"}
+      },
+      "if": {"properties": {"status": {"enum": ["FULL", "PARTIAL"]}}},
+      "then": {"not": {"required": ["handoff"]}}
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["http_attempts", "decision_calls", "embedding_calls", "generation_calls", "schema_repairs", "reported_cost_usd", "unknown_cost_calls"],
+      "properties": {
+        "http_attempts": {"type": "integer", "minimum": 0},
+        "decision_calls": {"type": "integer", "minimum": 0},
+        "embedding_calls": {"type": "integer", "minimum": 0},
+        "generation_calls": {"type": "integer", "minimum": 0},
+        "schema_repairs": {"type": "integer", "minimum": 0},
+        "reported_cost_usd": {"type": "number", "minimum": 0},
+        "unknown_cost_calls": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

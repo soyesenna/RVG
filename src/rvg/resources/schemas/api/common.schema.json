@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rvg:runtime-api:0.1:common",
+  "title": "rvg-runtime-api/0.1 common definitions",
+  "$defs": {
+    "api_version": {"const": "rvg-runtime-api/0.1"},
+    "observation_version": {"const": "rvg-observation/0.1"},
+    "timestamp": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+    },
+    "nullable_timestamp": {"oneOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "readiness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "observed_at", "reason"],
+      "properties": {
+        "state": {"enum": ["READY", "NOT_READY", "UNKNOWN", "NOT_APPLICABLE"]},
+        "observed_at": {"$ref": "#/$defs/nullable_timestamp"},
+        "reason": {"type": ["string", "null"]}
+      }
+    },
+    "readiness_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["durable_commit", "embedding_ready", "index_visible"],
+      "properties": {
+        "durable_commit": {"$ref": "#/$defs/readiness"},
+        "embedding_ready": {"$ref": "#/$defs/readiness"},
+        "index_visible": {"$ref": "#/$defs/readiness"}
+      }
+    },
+    "access_change": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["changed", "acl_epoch"],
+          "properties": {
+            "changed": {"type": "integer", "minimum": 0},
+            "acl_epoch": {"type": "integer", "minimum": 0}
+          }
+        }
+      ]
+    }
+  }
+}

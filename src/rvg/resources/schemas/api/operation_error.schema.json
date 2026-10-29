@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rvg:runtime-api:0.1:operation_error",
+  "title": "OperationError.to_dict()",
+  "description": "An operation that could not be done. Never carries request text, document text, credentials or connection strings; native_code names the rule or the failing type.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_version", "operation", "error"],
+  "properties": {
+    "api_version": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/api_version"},
+    "operation": {"enum": ["capabilities", "describe_runtime", "ingest", "apply_event", "answer", "health", "export_artifact_lineage", "close"]},
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "native_code", "retryable"],
+      "properties": {
+        "code": {"enum": ["UNSUPPORTED_CAPABILITY", "INVALID_INPUT", "FORBIDDEN_INPUT", "NOT_READY", "BACKEND_ERROR", "PROVIDER_ERROR", "TIMEOUT", "INTERNAL_ERROR"]},
+        "native_code": {"type": ["string", "null"]},
+        "retryable": {"type": ["boolean", "null"]}
+      }
+    }
+  }
+}

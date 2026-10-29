@@ -1,0 +1,1 @@
+ rejected_extraction failed a faithfulness check against draft: it omitted, duplicated, merged or invented assertions. Extract again from draft only; do not copy its mistakes.

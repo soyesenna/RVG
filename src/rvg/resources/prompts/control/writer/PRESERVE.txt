@@ -1,0 +1,1 @@
+ Never state a value or fact more broadly or more exactly than the evidence does: keep, in the same sentence, every restriction the evidence attaches to it (who it applies to, conditions, scope, time, and bounds such as 'only', 'at most' or 'at least').

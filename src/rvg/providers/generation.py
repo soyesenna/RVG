@@ -1,0 +1,432 @@
+"""Replaceable structured generation transport. No planner or ontology decisions here."""
+
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass, replace
+from typing import Literal, Protocol
+
+from pydantic import Field, SecretStr, ValidationError
+
+from ..contracts import Contract
+from ..errors import ContractError
+from ..prompts import prompt
+from ..runtime import CallContext
+from ..transport import JsonTransport
+from ..universal.trace import PARSER_VERSION, canonical_hash, node
+from . import claude_code
+from .validation import parse_usage
+
+GenerationRole = Literal["semantic", "surface", "direct"]
+
+
+class GenerationOptions(Contract):
+    temperature: float = Field(default=0, ge=0, le=2, allow_inf_nan=False)
+    max_tokens: int = Field(default=2048, ge=32, le=16384)
+    reasoning_enabled: bool | None = False
+    response_mode: Literal["json_schema", "json_object"] = "json_schema"
+    seed: int | None = None
+
+
+@dataclass(frozen=True)
+class GenerationRequest:
+    role: GenerationRole
+    system: str
+    payload: dict
+    response_type: type[Contract]
+    schema_name: str
+    prompt_version: str
+    options: GenerationOptions
+    schema_override: dict | None = None
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    value: Contract
+    metadata: dict
+
+
+class GenerationProvider(Protocol):
+    model: str
+    provider: str
+    mode: str
+
+    async def generate_structured(
+        self, request: GenerationRequest, context: CallContext
+    ) -> GenerationResult: ...
+
+
+def strict_schema(response_type: type[Contract]) -> dict:
+    def visit(node):
+        if isinstance(node, list):
+            return [visit(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        value = {
+            key: visit(item)
+            for key, item in node.items()
+            if key not in {"default", "discriminator"}
+        }
+        if value.get("type") == "object":
+            value["additionalProperties"] = False
+            value["required"] = list(value.get("properties", {}))
+        # Common structured-output providers support anyOf rather than discriminated oneOf.
+        if "oneOf" in value:
+            value["anyOf"] = value.pop("oneOf")
+        return value
+
+    return visit(response_type.model_json_schema())
+
+
+def parse_structured(content: str, response_type: type[Contract]) -> Contract:
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate_json_key")
+            result[key] = value
+        return result
+
+    def invalid_constant(value):
+        raise ValueError("nonfinite_json")
+
+    try:
+        # Reject duplicate keys, non-finite values, markdown wrappers and trailing prose.
+        json.loads(content, object_pairs_hook=pairs, parse_constant=invalid_constant)
+        return response_type.model_validate_json(content, strict=True)
+    except (ValueError, TypeError, ValidationError):
+        raise ContractError("generation_schema_invalid") from None
+
+
+class OpenRouterGenerationProvider:
+    provider = "openrouter"
+    mode = "live"
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        api_key: SecretStr,
+        base_url: str,
+        transport: JsonTransport,
+        default_response_mode="json_schema",
+        default_reasoning_enabled=False,
+    ):
+        self.model, self.api_key = model, api_key
+        self.base_url, self.transport = base_url, transport
+        self.default_response_mode = default_response_mode
+        self.default_reasoning_enabled = default_reasoning_enabled
+
+    async def generate_structured(
+        self, request: GenerationRequest, context: CallContext
+    ) -> GenerationResult:
+        try:
+            return await self._traced(request, context, "original")
+        except ContractError as exc:
+            if (
+                exc.code not in {"generation_schema_invalid", "generation_upstream_error"}
+                or context.schema_repairs >= context.max_schema_repairs
+            ):
+                raise
+            context.schema_repairs += 1
+            context.repairs.append({"role": request.role, "reason": exc.code})
+            repaired = replace(
+                request,
+                system=request.system
+                + prompt("providers.generation.generate_structured.schema_repair"),
+            )
+            return await self._traced(repaired, context, "repair")
+
+    async def _traced(self, request, context, attempt_kind):
+        """Observation only: one trace node per generation (input, schema/parser version, parsed
+        output); the call itself is unchanged."""
+        described = {
+            "model": self.model,
+            "role": request.role,
+            "system": request.system,
+            "payload": request.payload,
+            "schema_name": request.schema_name,
+            "options": request.options.model_dump(mode="json"),
+        }
+        with node(
+            "generation:" + request.role,
+            described,
+            attempt_kind=attempt_kind,
+            schema_name=request.schema_name,
+            prompt_version=request.prompt_version,
+            parser_version=PARSER_VERSION,
+            prompt_hash=canonical_hash(request.system),
+            provider_model=self.model,
+        ) as n:
+            result = await self._generate_once(request, context)
+            n.set(
+                provider_version=result.metadata.get("response_model"),
+                routing_provider=result.metadata.get("routing_provider"),
+                input_tokens=result.metadata.get("input_tokens"),
+                output_tokens=result.metadata.get("output_tokens"),
+                reported_cost_usd=result.metadata.get("cost_usd"),
+            )
+            n.output(result.metadata.get("structured_output"))
+            return result
+
+    async def _generate_once(
+        self, request: GenerationRequest, context: CallContext
+    ) -> GenerationResult:
+        defaults = {}
+        if "response_mode" not in request.options.model_fields_set:
+            defaults["response_mode"] = self.default_response_mode
+        if "reasoning_enabled" not in request.options.model_fields_set:
+            defaults["reasoning_enabled"] = self.default_reasoning_enabled
+        if defaults:
+            request = replace(
+                request,
+                options=GenerationOptions.model_validate(request.options.model_dump() | defaults),
+            )
+        content = json.dumps(request.payload, ensure_ascii=False, allow_nan=False)
+        schema = request.schema_override or strict_schema(request.response_type)
+        system = request.system
+        if request.options.response_mode == "json_object":
+            system += prompt("providers.generation._generate_once.json_object_schema") + json.dumps(
+                schema, ensure_ascii=False
+            )
+        if len(content.encode()) + len(system.encode()) > 100_000:
+            raise ContractError("generation_input_too_large")
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": content},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": request.schema_name,
+                    "strict": True,
+                    "schema": schema,
+                },
+            },
+            "provider": {"require_parameters": True},
+            "temperature": request.options.temperature,
+            "max_tokens": request.options.max_tokens,
+            "reasoning": {"enabled": request.options.reasoning_enabled, "exclude": True},
+            "stream": False,
+        }
+        if request.options.reasoning_enabled is None:
+            body.pop("reasoning")
+        if request.options.response_mode == "json_object":
+            body["response_format"] = {"type": "json_object"}
+        if request.options.seed is not None:
+            body["seed"] = request.options.seed
+        context.begin_call("generation:" + request.role)
+        started = time.monotonic()
+        metadata = {
+            "provider": self.provider,
+            "requested_model": self.model,
+            "role": request.role,
+            "prompt_version": request.prompt_version,
+            "schema_name": request.schema_name,
+            "options": request.options.model_dump(),
+            "status": "ERROR",
+        }
+        try:
+            payload = await self.transport.post(
+                self.base_url + "/chat/completions",
+                headers={"Authorization": "Bearer " + self.api_key.get_secret_value()},
+                body=body,
+                context=context,
+                provider=self.provider,
+                model=self.model,
+            )
+            try:
+                raw_usage = payload.get("usage") or {}
+                if not isinstance(raw_usage, dict):
+                    raise ContractError("invalid_generation_usage")
+                normalized = {
+                    "usage": {
+                        **raw_usage,
+                        "input_tokens": raw_usage.get("prompt_tokens"),
+                        "output_tokens": raw_usage.get("completion_tokens"),
+                    }
+                }
+                usage = parse_usage(normalized)
+            except ContractError:
+                context.record_cost(None)
+                raise
+            context.record_cost(usage.cost_usd)
+            metadata.update(
+                response_model=payload.get("model"),
+                resolved_model=None,
+                routing_provider=payload.get("provider"),
+                request_id=payload.get("id"),
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cost_usd=usage.cost_usd,
+            )
+            for key, group, field in (
+                ("reasoning_tokens", "completion_tokens_details", "reasoning_tokens"),
+                ("cached_tokens", "prompt_tokens_details", "cached_tokens"),
+            ):
+                details = raw_usage.get(group) or {}
+                if not isinstance(details, dict):
+                    raise ContractError("invalid_generation_usage_details")
+                value = details.get(field)
+                if value is not None and (type(value) is not int or value < 0):
+                    raise ContractError("invalid_generation_usage_details")
+                metadata[key] = value
+            if payload.get("model") != self.model:
+                raise ContractError("generation_response_model_mismatch")
+            choices = payload.get("choices")
+            if (
+                not isinstance(choices, list)
+                or len(choices) != 1
+                or not isinstance(choices[0], dict)
+            ):
+                raise ContractError("generation_choices_invalid")
+            choice = choices[0]
+            metadata["finish_reason"] = choice.get("finish_reason")
+            if choice.get("finish_reason") == "error":
+                raise ContractError("generation_upstream_error")
+            if choice.get("finish_reason") != "stop":
+                raise ContractError("generation_incomplete")
+            message = choice.get("message")
+            if not isinstance(message, dict) or message.get("refusal") or message.get("tool_calls"):
+                raise ContractError("generation_message_invalid")
+            answer = message.get("content")
+            if not isinstance(answer, str) or not answer.strip():
+                raise ContractError("generation_empty_content")
+            value = parse_structured(answer, request.response_type)
+            metadata["structured_output"] = value.model_dump(mode="json")
+            metadata["status"] = "SCHEMA_VALID"
+            return GenerationResult(value, metadata)
+        finally:
+            metadata["latency_ms"] = round((time.monotonic() - started) * 1000, 2)
+            context.generations.append(metadata)
+
+
+class ClaudeCodeGenerationProvider(OpenRouterGenerationProvider):
+    """Structured generation through the Claude Code CLI on the user's Claude subscription
+    (parent contract U21, docs/UNIVERSAL_U21_PROTOCOL.md §8.1). The request goes through the same
+    `JsonTransport.post` to `claude-code://print`, so tapes record and replay it like an HTTP
+    exchange; the schema repair and trace of `OpenRouterGenerationProvider` are reused unchanged.
+    The CLI cannot set a temperature, a token cap or a seed: the options are recorded, not applied.
+    Calls are not billed per token, so the run's cost meter gets 0 and the CLI's nominal cost is
+    kept in the metadata (`billing = "subscription"`)."""
+
+    provider = "claude_code"
+    mode = "live"
+
+    def __init__(self, *, model: str, transport: JsonTransport):
+        self.model, self.transport = model, transport
+        self.api_key, self.base_url = SecretStr(""), claude_code.URL
+        self.default_response_mode, self.default_reasoning_enabled = "json_schema", None
+
+    async def _generate_once(
+        self, request: GenerationRequest, context: CallContext
+    ) -> GenerationResult:
+        content = json.dumps(request.payload, ensure_ascii=False, allow_nan=False)
+        schema = request.schema_override or strict_schema(request.response_type)
+        if len(content.encode()) + len(request.system.encode()) > 100_000:
+            raise ContractError("generation_input_too_large")
+        body = {
+            "model": self.model,
+            "system": request.system,
+            "input": content,
+            "json_schema": schema,
+            "options": request.options.model_dump(mode="json"),
+        }
+        context.begin_call("generation:" + request.role)
+        started = time.monotonic()
+        metadata = {
+            "provider": self.provider,
+            "requested_model": self.model,
+            "role": request.role,
+            "prompt_version": request.prompt_version,
+            "schema_name": request.schema_name,
+            "options": request.options.model_dump(),
+            "options_applied": False,
+            "billing": "subscription",
+            "status": "ERROR",
+        }
+        try:
+            payload = await self.transport.post(
+                claude_code.URL,
+                headers={},
+                body=body,
+                context=context,
+                provider=self.provider,
+                model=self.model,
+            )
+            context.record_cost(0.0)
+            usage = payload.get("usage") or {}
+            models = payload.get("modelUsage") or {}
+            if not isinstance(usage, dict) or not isinstance(models, dict):
+                raise ContractError("invalid_generation_usage")
+            details = usage.get("output_tokens_details") or {}
+            metadata.update(
+                response_model=next(iter(models)) if len(models) == 1 else sorted(models),
+                resolved_model=None,
+                routing_provider="claude_code_cli",
+                request_id=payload.get("session_id"),
+                input_tokens=usage.get("input_tokens"),
+                output_tokens=usage.get("output_tokens"),
+                cached_tokens=usage.get("cache_read_input_tokens"),
+                cache_creation_tokens=usage.get("cache_creation_input_tokens"),
+                reasoning_tokens=details.get("thinking_tokens")
+                if isinstance(details, dict)
+                else None,
+                cost_usd=0.0,
+                nominal_cost_usd=payload.get("total_cost_usd"),
+                cli_duration_ms=payload.get("duration_ms"),
+                finish_reason=payload.get("stop_reason"),
+            )
+            if list(models) != [self.model]:
+                raise ContractError("generation_response_model_mismatch")
+            if payload.get("subtype") != "success" or payload.get("is_error") is not False:
+                raise ContractError("generation_upstream_error")
+            structured = payload.get("structured_output")
+            if structured is not None:
+                answer = json.dumps(structured, ensure_ascii=False, allow_nan=False)
+            else:
+                answer = payload.get("result")
+            if not isinstance(answer, str) or not answer.strip():
+                raise ContractError("generation_empty_content")
+            value = parse_structured(answer, request.response_type)
+            metadata["structured_output"] = value.model_dump(mode="json")
+            metadata["status"] = "SCHEMA_VALID"
+            return GenerationResult(value, metadata)
+        finally:
+            metadata["latency_ms"] = round((time.monotonic() - started) * 1000, 2)
+            context.generations.append(metadata)
+
+
+class MockGenerationProvider:
+    provider = "mock"
+    model = "mock-not-generative-model"
+    mode = "mock"
+
+    def __init__(self, fixtures: tuple[str, ...] = ()):
+        self.fixtures = iter(fixtures)
+
+    async def generate_structured(
+        self, request: GenerationRequest, context: CallContext
+    ) -> GenerationResult:
+        context.begin_call("generation:" + request.role)
+        # 0.1.0 (parent PUB-2b): without a fixture, the product path's schemas get the mock rules
+        # (an extractive draft, one slot, no rewrite or query), so mock mode answers end to end
+        raw = next(self.fixtures, None)
+        if raw is None:
+            from .mock import structured_text
+
+            raw = structured_text(request.schema_name, request.payload) or '{"candidates":[]}'
+        value = parse_structured(raw, request.response_type)
+        metadata = {
+            "provider": "mock",
+            "requested_model": self.model,
+            "role": request.role,
+            "status": "SCHEMA_VALID",
+            "cost_usd": 0,
+            "prompt_version": request.prompt_version,
+        }
+        context.generations.append(metadata)
+        return GenerationResult(value, metadata)

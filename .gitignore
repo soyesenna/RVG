@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.env
+.DS_Store
+# local release staging and handoff artifacts (wheels, locks, evidence); never committed
+.handoff/

@@ -1,0 +1,724 @@
+"""PostgreSQL adapter of the knowledge state and vector blob ports (PORT-1): the same meaning as
+the SQLite store without SQLite.
+
+Commit order. Every writer of a tenant — insert, revocation, ACL change, vector write — first
+takes the tenant's row lock (`UPDATE tenants ... RETURNING` or `SELECT ... FOR UPDATE`) and
+advances that row's counters inside the same transaction as its change, its event and its outbox
+row. The lock is held to commit, so a tenant's event numbers, ACL epochs and outbox numbers are
+given out in commit order and without gaps; no sequence or serial is read as a watermark. A
+failed transaction consumes nothing.
+
+The release check reads under `FOR SHARE` on the same row: it waits for a writer that holds the
+row and keeps writers out while it reads, so what it returns is the committed state at that
+instant — never a transaction snapshot taken earlier. No transaction stays open across a model
+call; every method opens and closes its own.
+
+Documents keep their JSON body byte for byte (TEXT, not JSONB) so the knowledge digest is the
+SQLite store's. Order is decided in Python by code points, never by a database collation."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import threading
+from collections.abc import Iterable
+from contextlib import contextmanager
+
+import numpy as np
+
+from ..errors import ConfigurationError, ContractError
+from ..temporal.access import Release, hidden_ids
+from ..temporal.models import TemporalDocument
+from .digest import knowledge_digest
+from .identity import embedding_input, input_hash
+from .ports import CatalogRows, Generations, VectorScan
+from .sqlite import canonical_vector
+
+SCHEMA_VERSION = "1"
+_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+
+DDL = """
+CREATE TABLE IF NOT EXISTS rvg_meta(key text PRIMARY KEY, value text NOT NULL);
+CREATE TABLE IF NOT EXISTS tenants(
+  tenant text PRIMARY KEY,
+  knowledge_seq bigint NOT NULL DEFAULT 0,
+  document_seq bigint NOT NULL DEFAULT 0,
+  revocation_seq bigint NOT NULL DEFAULT 0,
+  acl_epoch bigint NOT NULL DEFAULT 0,
+  outbox_seq bigint NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS events(
+  tenant text NOT NULL, seq bigint NOT NULL, kind text, document_id text, revision integer,
+  PRIMARY KEY(tenant, seq));
+CREATE TABLE IF NOT EXISTS documents(
+  tenant text NOT NULL, id text NOT NULL, revision integer NOT NULL, body text NOT NULL,
+  family text NOT NULL, event_seq bigint,
+  PRIMARY KEY(tenant, id, revision));
+CREATE INDEX IF NOT EXISTS documents_event ON documents(tenant, event_seq);
+CREATE TABLE IF NOT EXISTS revocations(
+  tenant text NOT NULL, id text NOT NULL, event_seq bigint, PRIMARY KEY(tenant, id));
+CREATE INDEX IF NOT EXISTS revocations_event ON revocations(tenant, event_seq);
+CREATE TABLE IF NOT EXISTS acl(
+  tenant text NOT NULL, id text NOT NULL, principal text NOT NULL,
+  effect text NOT NULL CHECK (effect IN ('allow', 'deny')), PRIMARY KEY(tenant, id, principal));
+CREATE TABLE IF NOT EXISTS outbox(
+  tenant text NOT NULL, seq bigint NOT NULL, kind text NOT NULL, knowledge_seq bigint,
+  payload text NOT NULL, PRIMARY KEY(tenant, seq));
+CREATE TABLE IF NOT EXISTS vector_spaces(
+  tenant text NOT NULL, space text NOT NULL, vector_seq bigint NOT NULL DEFAULT 0,
+  PRIMARY KEY(tenant, space));
+CREATE TABLE IF NOT EXISTS projection_frontiers(
+  tenant text NOT NULL, space text NOT NULL, index_name text NOT NULL,
+  vector_seq bigint NOT NULL DEFAULT 0, document_seq bigint NOT NULL DEFAULT 0,
+  token bigint NOT NULL DEFAULT 0, holder text, expires double precision NOT NULL DEFAULT 0,
+  PRIMARY KEY(tenant, space, index_name));
+CREATE TABLE IF NOT EXISTS vectors(
+  tenant text NOT NULL, space text NOT NULL, input_hash text NOT NULL, dims integer NOT NULL,
+  dtype text NOT NULL, data bytea NOT NULL, sha256 text NOT NULL, seq bigint NOT NULL,
+  PRIMARY KEY(tenant, space, input_hash));
+"""
+
+
+class PostgresState:
+    backend = "postgres"
+
+    def __init__(self, dsn, *, schema=None):
+        import psycopg
+
+        self._psycopg = psycopg
+        schema = schema or "rvg"
+        if not _NAME.match(schema):
+            raise ConfigurationError("invalid_postgres_schema_name")
+        self.schema, self._dsn = schema, dsn
+        self.lock = threading.RLock()
+        self.conn = self._connect()
+        with self.lock, self.conn.transaction():
+            self.conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+            self.conn.execute(DDL)
+            self.conn.execute(
+                "INSERT INTO rvg_meta VALUES('schema_version', %s) ON CONFLICT DO NOTHING",
+                (SCHEMA_VERSION,),
+            )
+            version = self.conn.execute(
+                "SELECT value FROM rvg_meta WHERE key='schema_version'"
+            ).fetchone()[0]
+        if version != SCHEMA_VERSION:
+            raise ConfigurationError("postgres_schema_version_mismatch")
+        self._server = self.conn.execute("SHOW server_version").fetchone()[0]
+
+    def _connect(self):
+        return self._psycopg.connect(
+            self._dsn, autocommit=True, options=f"-c search_path={self.schema}"
+        )
+
+    def describe(self):
+        return {
+            "backend": self.backend,
+            "engine_version": self._server,
+            "driver": f"psycopg {self._psycopg.__version__}",
+            "schema_version": SCHEMA_VERSION,
+            "isolation": "read_committed_statements_under_tenant_row_lock",
+            "event_order": "tenant_row_lock_counter",
+            "release_read": "tenant_row_for_share",
+            "multi_host": "state_shared; local exact index files are per host",
+        }
+
+    def close(self):
+        with self.lock:
+            self.conn.close()
+
+    @contextmanager
+    def _tx(self):
+        with self.lock, self.conn.transaction():
+            yield self.conn
+
+    def _one(self, sql, params=()):
+        with self.lock:
+            return self.conn.execute(sql, params).fetchone()
+
+    def _all(self, sql, params=()):
+        with self.lock:
+            return self.conn.execute(sql, params).fetchall()
+
+    def _tenant(self, conn, tenant):
+        conn.execute("INSERT INTO tenants(tenant) VALUES(%s) ON CONFLICT DO NOTHING", (tenant,))
+
+    def _next_event(self, conn, tenant, column, number=None):
+        """The tenant's next knowledge event number, or `number` when a catch-up replays another
+        deployment's event (PORT-3), which must come after every event of the tenant."""
+        row = conn.execute(
+            f"UPDATE tenants SET knowledge_seq=COALESCE(%(n)s::bigint, knowledge_seq+1), "
+            f"{column}=COALESCE(%(n)s::bigint, knowledge_seq+1) WHERE tenant=%(t)s "
+            "AND (%(n)s::bigint IS NULL OR %(n)s::bigint > knowledge_seq) RETURNING knowledge_seq",
+            {"n": number, "t": tenant},
+        ).fetchone()
+        if row is None:
+            raise ContractError("event_number_not_after_snapshot")
+        return row[0]
+
+    def _outbox(self, conn, tenant, kind, seq, payload):
+        (number,) = conn.execute(
+            "UPDATE tenants SET outbox_seq=outbox_seq+1 WHERE tenant=%s RETURNING outbox_seq",
+            (tenant,),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO outbox VALUES(%s,%s,%s,%s,%s)",
+            (tenant, number, kind, seq, json.dumps(payload, sort_keys=True)),
+        )
+
+    # --- knowledge state ----------------------------------------------------------------------
+    def upsert(self, tenant, document: TemporalDocument, *, event_seq=None):
+        if not tenant.strip():
+            raise ValueError("tenant_required")
+        body = document.model_dump_json()
+        with self._tx() as conn:
+            self._tenant(conn, tenant)
+            conn.execute("SELECT 1 FROM tenants WHERE tenant=%s FOR UPDATE", (tenant,))
+            old = conn.execute(
+                "SELECT body FROM documents WHERE tenant=%s AND id=%s AND revision=%s",
+                (tenant, document.id, document.revision),
+            ).fetchone()
+            if old:
+                if old[0] != body:
+                    raise ValueError("immutable_temporal_revision_changed")
+            else:
+                seq = self._next_event(conn, tenant, "document_seq", event_seq)
+                conn.execute(
+                    "INSERT INTO events VALUES(%s,%s,'insert',%s,%s)",
+                    (tenant, seq, document.id, document.revision),
+                )
+                conn.execute(
+                    "INSERT INTO documents VALUES(%s,%s,%s,%s,%s,%s)",
+                    (tenant, document.id, document.revision, body, document.family, seq),
+                )
+                self._outbox(
+                    conn,
+                    tenant,
+                    "insert",
+                    seq,
+                    {
+                        "id": document.id,
+                        "revision": document.revision,
+                        "input_hash": input_hash(embedding_input(document)),
+                    },
+                )
+        return self.snapshot(tenant)
+
+    def revoke(self, tenant, identifier, *, event_seq=None):
+        """Revoke every revision of a document; a repeated revocation records nothing."""
+        with self._tx() as conn:
+            self._tenant(conn, tenant)
+            conn.execute("SELECT 1 FROM tenants WHERE tenant=%s FOR UPDATE", (tenant,))
+            added = conn.execute(
+                "INSERT INTO revocations(tenant,id) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                (tenant, identifier),
+            ).rowcount
+            if added:
+                seq = self._next_event(conn, tenant, "revocation_seq", event_seq)
+                conn.execute(
+                    "INSERT INTO events VALUES(%s,%s,'revoke',%s,NULL)", (tenant, seq, identifier)
+                )
+                conn.execute(
+                    "UPDATE revocations SET event_seq=%s WHERE tenant=%s AND id=%s",
+                    (seq, tenant, identifier),
+                )
+                self._outbox(conn, tenant, "revoke", seq, {"id": identifier})
+
+    def set_access(self, tenant, identifier, principal, effect):
+        if effect not in {"allow", "deny", None}:
+            raise ValueError("invalid_acl_effect")
+        with self._tx() as conn:
+            self._tenant(conn, tenant)
+            (epoch,) = conn.execute(
+                "UPDATE tenants SET acl_epoch=acl_epoch+1 WHERE tenant=%s RETURNING acl_epoch",
+                (tenant,),
+            ).fetchone()
+            if effect is None:
+                conn.execute(
+                    "DELETE FROM acl WHERE tenant=%s AND id=%s AND principal=%s",
+                    (tenant, identifier, principal),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO acl VALUES(%s,%s,%s,%s) ON CONFLICT(tenant,id,principal) "
+                    "DO UPDATE SET effect=EXCLUDED.effect",
+                    (tenant, identifier, principal, effect),
+                )
+            self._outbox(
+                conn,
+                tenant,
+                "acl",
+                None,
+                {"id": identifier, "principal": principal, "effect": effect, "epoch": epoch},
+            )
+
+    def acl_epoch(self, tenant):
+        row = self._one("SELECT acl_epoch FROM tenants WHERE tenant=%s", (tenant,))
+        return row[0] if row else 0
+
+    def hidden(self, tenant, principal):
+        rows = self._all("SELECT id,principal,effect FROM acl WHERE tenant=%s", (tenant,))
+        return hidden_ids(rows, principal)
+
+    def revoked(self, tenant, *, at=None):
+        return {
+            r[0]
+            for r in self._all(
+                "SELECT id FROM revocations WHERE tenant=%s "
+                "AND (%s::bigint IS NULL OR event_seq IS NULL OR event_seq<=%s::bigint)",
+                (tenant, at, at),
+            )
+        }
+
+    def changed_families(self, tenant, since):
+        return {
+            r[0]
+            for r in self._all(
+                "SELECT family FROM documents WHERE tenant=%s AND event_seq>%s "
+                "UNION SELECT d.family FROM documents d JOIN revocations r "
+                "ON r.tenant=d.tenant AND r.id=d.id WHERE d.tenant=%s AND r.event_seq>%s",
+                (tenant, since, tenant, since),
+            )
+        }
+
+    def authorize_release(self, tenant, document_ids, principal):
+        """The release fence: under `FOR SHARE` on the tenant row, which every writer of the
+        tenant must hold exclusively to change anything, read revocations, ACL and counters."""
+        ids = sorted(set(document_ids))
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT knowledge_seq, acl_epoch FROM tenants WHERE tenant=%s FOR SHARE", (tenant,)
+            ).fetchone()
+            seq, epoch = row if row else (0, 0)
+            revoked = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT id FROM revocations WHERE tenant=%s AND id = ANY(%s)", (tenant, ids)
+                )
+            }
+            rows = conn.execute(
+                "SELECT id,principal,effect FROM acl WHERE tenant=%s", (tenant,)
+            ).fetchall()
+        hidden = hidden_ids(rows, principal) & set(ids)
+        if revoked:
+            return Release(False, "revoked_before_release", seq, epoch, tuple(sorted(revoked)))
+        if hidden:
+            return Release(
+                False, "permission_changed_before_release", seq, epoch, tuple(sorted(hidden))
+            )
+        return Release(True, None, seq, epoch)
+
+    def snapshot(self, tenant):
+        row = self._one("SELECT knowledge_seq FROM tenants WHERE tenant=%s", (tenant,))
+        return row[0] if row else 0
+
+    def generations(self, tenant):
+        row = self._one(
+            "SELECT knowledge_seq, document_seq, revocation_seq, acl_epoch FROM tenants "
+            "WHERE tenant=%s",
+            (tenant,),
+        )
+        return Generations(*(row or (0, 0, 0, 0)))
+
+    def catalog_rows(self, tenant):
+        with self.lock, self.conn.transaction():
+            self.conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            row = self.conn.execute(
+                "SELECT knowledge_seq, document_seq, revocation_seq, acl_epoch FROM tenants "
+                "WHERE tenant=%s",
+                (tenant,),
+            ).fetchone()
+            rows = self.conn.execute(
+                "SELECT id,revision,event_seq FROM documents WHERE tenant=%s", (tenant,)
+            ).fetchall()
+        rows = sorted((r[0], r[1], r[2]) for r in rows)
+        return CatalogRows(Generations(*(row or (0, 0, 0, 0))), tuple(rows))
+
+    def bodies(self, tenant, keys: Iterable[tuple[str, int]]):
+        keys = sorted(set(keys))
+        rows = self._all(
+            "SELECT d.id,d.revision,d.body FROM documents d "
+            "JOIN unnest(%s::text[], %s::integer[]) AS k(id, revision) "
+            "ON d.id=k.id AND d.revision=k.revision WHERE d.tenant=%s",
+            ([k[0] for k in keys], [k[1] for k in keys], tenant),
+        )
+        return {(r[0], r[1]): TemporalDocument.model_validate_json(r[2]) for r in rows}
+
+    def documents(self, tenant, *, known_at=None, allowed_ids=None, at=None):
+        rows = self._all(
+            """
+            SELECT d.id, d.revision, d.body FROM documents d WHERE d.tenant=%s
+            AND (%s::bigint IS NULL OR d.event_seq IS NULL OR d.event_seq<=%s::bigint)
+            AND NOT EXISTS (SELECT 1 FROM revocations r WHERE r.tenant=d.tenant AND r.id=d.id
+              AND (%s::bigint IS NULL OR r.event_seq IS NULL OR r.event_seq<=%s::bigint))
+            """,
+            (tenant, at, at, at, at),
+        )
+        docs = [
+            TemporalDocument.model_validate_json(r[2])
+            for r in sorted(rows, key=lambda r: (r[0], r[1]))
+        ]
+        return [
+            d
+            for d in docs
+            if (known_at is None or d.observed_at <= known_at)
+            and (allowed_ids is None or d.id in allowed_ids)
+        ]
+
+    def events(self, tenant, since=0):
+        return [
+            {"seq": r[0], "kind": r[1], "document_id": r[2], "revision": r[3]}
+            for r in self._all(
+                "SELECT seq,kind,document_id,revision FROM events WHERE tenant=%s AND seq>%s "
+                "ORDER BY seq",
+                (tenant, since),
+            )
+        ]
+
+    def outbox(self, tenant, since=0):
+        return [
+            {"id": r[0], "kind": r[1], "knowledge_seq": r[2], "payload": json.loads(r[3])}
+            for r in self._all(
+                "SELECT seq,kind,knowledge_seq,payload FROM outbox WHERE tenant=%s AND seq>%s "
+                "ORDER BY seq",
+                (tenant, since),
+            )
+        ]
+
+    def digest(self, tenant, space=None):
+        with self.lock, self.conn.transaction():
+            self.conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            documents = self.conn.execute(
+                "SELECT id,revision,body FROM documents WHERE tenant=%s", (tenant,)
+            ).fetchall()
+            revocations = [
+                r[0]
+                for r in self.conn.execute("SELECT id FROM revocations WHERE tenant=%s", (tenant,))
+            ]
+            vectors = (
+                None
+                if space is None
+                else self.conn.execute(
+                    "SELECT input_hash,data FROM vectors WHERE tenant=%s AND space=%s",
+                    (tenant, space),
+                ).fetchall()
+            )
+        return knowledge_digest(
+            sorted(documents, key=lambda r: (r[0], r[1])),
+            sorted(revocations),
+            None if vectors is None else sorted((r[0], bytes(r[1])) for r in vectors),
+        )
+
+    # --- vector blobs -------------------------------------------------------------------------
+    def put_vector(self, tenant, space, text, vector):
+        return self.put_vector_blob(tenant, space, input_hash(text), vector)
+
+    def put_vector_blob(self, tenant, space, key, vector):
+        """`put_vector` by input hash: a catch-up copies vectors without their input text."""
+        value = canonical_vector(vector)
+        data = value.astype("<f8").tobytes()
+        with self._tx() as conn:
+            self._tenant(conn, tenant)
+            conn.execute("SELECT 1 FROM tenants WHERE tenant=%s FOR UPDATE", (tenant,))
+            old = conn.execute(
+                "SELECT data FROM vectors WHERE tenant=%s AND space=%s AND input_hash=%s",
+                (tenant, space, key),
+            ).fetchone()
+            if old is not None and bytes(old[0]) == data:
+                return False
+            conn.execute(
+                "INSERT INTO vector_spaces(tenant,space) VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                (tenant, space),
+            )
+            (seq,) = conn.execute(
+                "UPDATE vector_spaces SET vector_seq=vector_seq+1 WHERE tenant=%s AND space=%s "
+                "RETURNING vector_seq",
+                (tenant, space),
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO vectors VALUES(%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT(tenant,space,input_hash) DO UPDATE SET dims=EXCLUDED.dims, "
+                "dtype=EXCLUDED.dtype, data=EXCLUDED.data, sha256=EXCLUDED.sha256, "
+                "seq=EXCLUDED.seq",
+                (
+                    tenant,
+                    space,
+                    key,
+                    int(value.shape[0]),
+                    "<f8",
+                    data,
+                    hashlib.sha256(data).hexdigest(),
+                    seq,
+                ),
+            )
+            self._outbox(
+                conn, tenant, "vector", None, {"space": space, "input_hash": key, "seq": seq}
+            )
+        return True
+
+    def vector_checksums(self, tenant, space):
+        """(input hash, sha256 of the bytes) of every vector of a space, sorted (PORT-3)."""
+        return sorted(
+            (r[0], r[1])
+            for r in self._all(
+                "SELECT input_hash,sha256 FROM vectors WHERE tenant=%s AND space=%s",
+                (tenant, space),
+            )
+        )
+
+    def vector(self, tenant, space, text):
+        row = self._one(
+            "SELECT data,sha256 FROM vectors WHERE tenant=%s AND space=%s AND input_hash=%s",
+            (tenant, space, input_hash(text)),
+        )
+        if row is None:
+            return None
+        data = bytes(row[0])
+        if hashlib.sha256(data).hexdigest() != row[1]:
+            raise ContractError("vector_blob_corrupted")
+        return np.frombuffer(data, dtype="<f8").astype(np.float64)
+
+    def has_vectors(self, tenant, space, hashes):
+        return {
+            r[0]
+            for r in self._all(
+                "SELECT input_hash FROM vectors WHERE tenant=%s AND space=%s "
+                "AND input_hash = ANY(%s)",
+                (tenant, space, list(hashes)),
+            )
+        }
+
+    def vectors(self, tenant, space, hashes):
+        out = {}
+        for h, data, digest in self._all(
+            "SELECT input_hash,data,sha256 FROM vectors WHERE tenant=%s AND space=%s "
+            "AND input_hash = ANY(%s)",
+            (tenant, space, list(hashes)),
+        ):
+            data = bytes(data)
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise ContractError("vector_blob_corrupted")
+            out[h] = np.frombuffer(data, dtype="<f8").astype(np.float64)
+        return out
+
+    def vector_meta(self, tenant, space):
+        return {
+            r[0]: (r[1], r[2])
+            for r in self._all(
+                "SELECT input_hash,dims,seq FROM vectors WHERE tenant=%s AND space=%s",
+                (tenant, space),
+            )
+        }
+
+    def projection_frontier(self, tenant, space, index):
+        row = self._one(
+            "SELECT vector_seq,document_seq,token FROM projection_frontiers "
+            "WHERE tenant=%s AND space=%s AND index_name=%s",
+            (tenant, space, index),
+        )
+        return (
+            {"vector_seq": row[0], "document_seq": row[1], "token": row[2]}
+            if row
+            else {"vector_seq": 0, "document_seq": 0, "token": 0}
+        )
+
+    def projection_lease(self, tenant, space, index, holder, *, now, ttl):
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO projection_frontiers(tenant,space,index_name) VALUES(%s,%s,%s) "
+                "ON CONFLICT DO NOTHING",
+                (tenant, space, index),
+            )
+            token, owner, expires = conn.execute(
+                "SELECT token,holder,expires FROM projection_frontiers WHERE tenant=%s "
+                "AND space=%s AND index_name=%s FOR UPDATE",
+                (tenant, space, index),
+            ).fetchone()
+            if owner not in (None, holder) and expires > now:
+                return None
+            conn.execute(
+                "UPDATE projection_frontiers SET token=%s,holder=%s,expires=%s "
+                "WHERE tenant=%s AND space=%s AND index_name=%s",
+                (token + 1, holder, now + ttl, tenant, space, index),
+            )
+            return token + 1
+
+    def advance_projection(self, tenant, space, index, token, vector_seq, document_seq):
+        with self._tx() as conn:
+            moved = conn.execute(
+                "UPDATE projection_frontiers SET vector_seq=GREATEST(vector_seq,%s),"
+                "document_seq=GREATEST(document_seq,%s) WHERE tenant=%s AND space=%s "
+                "AND index_name=%s AND token=%s",
+                (vector_seq, document_seq, tenant, space, index, token),
+            ).rowcount
+        return bool(moved)
+
+    def vector_seq(self, tenant, space):
+        row = self._one(
+            "SELECT vector_seq FROM vector_spaces WHERE tenant=%s AND space=%s", (tenant, space)
+        )
+        return row[0] if row else 0
+
+    @contextmanager
+    def scan_changes(self, tenant, space, since):
+        """Vectors written after `vector_seq` `since` (latest bytes, (seq, hash) order) and the
+        `vector_seq` of the same snapshot (N1F-2)."""
+        with self.lock, self.conn.transaction():
+            self.conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            row = self.conn.execute(
+                "SELECT vector_seq FROM vector_spaces WHERE tenant=%s AND space=%s",
+                (tenant, space),
+            ).fetchone()
+            rows = self.conn.execute(
+                "SELECT input_hash,dims,data,seq FROM vectors WHERE tenant=%s AND space=%s "
+                'AND seq>%s ORDER BY seq, input_hash COLLATE "C"',
+                (tenant, space, since),
+            ).fetchall()
+        yield VectorScan(
+            row[0] if row else 0, len(rows), iter([(h, d, bytes(b), q) for h, d, b, q in rows])
+        )
+
+    @contextmanager
+    def scan_vectors(self, tenant, space, *, source="binary"):
+        """Every vector of (tenant, space) in input-hash order (code points) with the
+        `vector_seq` of the same snapshot, streamed through a server-side cursor on a
+        connection of its own (a build in a worker thread never holds the store lock)."""
+        if source != "binary":
+            raise ValueError("postgres_stores_binary_vectors_only")
+        conn = self._connect()
+        try:
+            with conn.transaction():
+                conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                row = conn.execute(
+                    "SELECT vector_seq FROM vector_spaces WHERE tenant=%s AND space=%s",
+                    (tenant, space),
+                ).fetchone()
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM vectors WHERE tenant=%s AND space=%s", (tenant, space)
+                ).fetchone()[0]
+                cursor = conn.cursor(name="rvg_scan")
+                cursor.itersize = 2048
+                cursor.execute(
+                    "SELECT input_hash, dims, data FROM vectors WHERE tenant=%s AND space=%s "
+                    'ORDER BY input_hash COLLATE "C"',
+                    (tenant, space),
+                )
+                yield VectorScan(
+                    row[0] if row else 0,
+                    count,
+                    ((h, d, bytes(b)) for h, d, b in cursor),
+                    "binary",
+                )
+                cursor.close()
+        finally:
+            conn.close()
+
+    # --- export/import between deployments (PORT-1, PORT-3) -----------------------------------
+    def export_tenant(self, tenant):
+        return self.export_with_mark(tenant)[0]
+
+    def outbox_mark(self, tenant):
+        """The last outbox entry of a tenant (PORT-3: where a catch-up continues from)."""
+        return self._one("SELECT COALESCE(MAX(seq),0) FROM outbox WHERE tenant=%s", (tenant,))[0]
+
+    def export_with_mark(self, tenant):
+        """`export_tenant` and the outbox mark of the same snapshot (PORT-3)."""
+        with self.lock, self.conn.transaction():
+            self.conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            (mark,) = self.conn.execute(
+                "SELECT COALESCE(MAX(seq),0) FROM outbox WHERE tenant=%s", (tenant,)
+            ).fetchone()
+            events = self.conn.execute(
+                "SELECT seq,kind,document_id,revision FROM events WHERE tenant=%s ORDER BY seq",
+                (tenant,),
+            ).fetchall()
+            documents = self.conn.execute(
+                "SELECT id,revision,body,event_seq,family FROM documents WHERE tenant=%s",
+                (tenant,),
+            ).fetchall()
+            revocations = self.conn.execute(
+                "SELECT id,event_seq FROM revocations WHERE tenant=%s", (tenant,)
+            ).fetchall()
+            acl = self.conn.execute(
+                "SELECT id,principal,effect FROM acl WHERE tenant=%s", (tenant,)
+            ).fetchall()
+            row = self.conn.execute(
+                "SELECT acl_epoch FROM tenants WHERE tenant=%s", (tenant,)
+            ).fetchone()
+            vectors = self.conn.execute(
+                "SELECT space,input_hash,dims,data,sha256,seq FROM vectors WHERE tenant=%s",
+                (tenant,),
+            ).fetchall()
+        export = {
+            "events": [
+                {"seq": r[0], "kind": r[1], "document_id": r[2], "revision": r[3]} for r in events
+            ],
+            "documents": [
+                {"id": r[0], "revision": r[1], "body": r[2], "event_seq": r[3], "family": r[4]}
+                for r in documents
+            ],
+            "revocations": [{"id": r[0], "event_seq": r[1]} for r in revocations],
+            "acl": [{"id": r[0], "principal": r[1], "effect": r[2]} for r in acl],
+            "acl_epoch": row[0] if row else 0,
+            "vectors": [
+                {
+                    "space": r[0],
+                    "input_hash": r[1],
+                    "dims": r[2],
+                    "data": bytes(r[3]),
+                    "sha256": r[4],
+                    "seq": r[5],
+                }
+                for r in vectors
+            ],
+        }
+        return export, mark
+
+    def import_tenant(self, tenant, *, events, documents, revocations, acl, acl_epoch, vectors):
+        """Load one tenant exported from another state store, keeping its event numbers, in one
+        transaction. Only into an empty tenant; vectors keep their bytes (no re-embedding)."""
+        with self._tx() as conn:
+            if conn.execute("SELECT 1 FROM tenants WHERE tenant=%s", (tenant,)).fetchone():
+                raise ValueError("import_target_tenant_not_empty")
+            knowledge = max([e["seq"] for e in events], default=0)
+            docs = max([d["event_seq"] or 0 for d in documents], default=0)
+            revs = max([r["event_seq"] or 0 for r in revocations], default=0)
+            conn.execute(
+                "INSERT INTO tenants VALUES(%s,%s,%s,%s,%s,0)",
+                (tenant, knowledge, docs, revs, acl_epoch),
+            )
+            with conn.cursor() as cur:
+                with cur.copy("COPY events FROM STDIN") as copy:
+                    for e in events:
+                        copy.write_row(
+                            (tenant, e["seq"], e["kind"], e["document_id"], e["revision"])
+                        )
+                with cur.copy("COPY documents FROM STDIN") as copy:
+                    for d in documents:
+                        copy.write_row(
+                            (tenant, d["id"], d["revision"], d["body"], d["family"], d["event_seq"])
+                        )
+                with cur.copy("COPY revocations FROM STDIN") as copy:
+                    for r in revocations:
+                        copy.write_row((tenant, r["id"], r["event_seq"]))
+                with cur.copy("COPY acl FROM STDIN") as copy:
+                    for a in acl:
+                        copy.write_row((tenant, a["id"], a["principal"], a["effect"]))
+                spaces = {}
+                with cur.copy("COPY vectors FROM STDIN") as copy:
+                    for v in vectors:
+                        spaces[v["space"]] = max(spaces.get(v["space"], 0), v["seq"])
+                        copy.write_row(
+                            (
+                                tenant,
+                                v["space"],
+                                v["input_hash"],
+                                v["dims"],
+                                "<f8",
+                                v["data"],
+                                v["sha256"],
+                                v["seq"],
+                            )
+                        )
+            for space, seq in spaces.items():
+                conn.execute("INSERT INTO vector_spaces VALUES(%s,%s,%s)", (tenant, space, seq))

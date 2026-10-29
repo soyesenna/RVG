@@ -1,0 +1,1 @@
+Using ONLY the supplied evidence, does the evidence entail EVERY material assertion of the claim, with entity, quantity, units, date, negation, modality and conditions preserved? A compound claim is supported only when every assertion is supported; insufficient evidence means no.

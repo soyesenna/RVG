@@ -1,0 +1,30 @@
+"""`TemporalStore`: the SQLite + local exact deployment under its historical name, so the N0-N3
+runners and tests keep working. The product path does not depend on it: the retriever and the
+engine use the storage ports (`deepjev.storage`), and any deployment `open_storage` builds —
+SQLite or PostgreSQL state — runs the same code."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from ..storage.factory import local_storage
+from ..storage.sqlite import SQLiteState
+from .retriever import INDEX_BATCH, TemporalRetriever
+
+__all__ = ["INDEX_BATCH", "TemporalRetriever", "TemporalStore"]
+
+
+class TemporalStore(SQLiteState):
+    """Immutable source events and reusable vectors; no time-unsafe answer cache. Dense search
+    uses the local exact index; `dense_memmap_dir` keeps its matrices in files (N1: next to the
+    store, `<store>.dense/`; an in-memory store keeps them in memory)."""
+
+    def __init__(self, path, *, dense_memmap_dir="beside"):
+        super().__init__(path)
+        if dense_memmap_dir == "beside":
+            dense_memmap_dir = None if str(path) == ":memory:" else Path(f"{path}.dense")
+        self.storage = local_storage(self, matrix_dir=dense_memmap_dir)
+
+    @property
+    def index(self):
+        return self.storage.index

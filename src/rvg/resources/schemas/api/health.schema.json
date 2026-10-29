@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rvg:runtime-api:0.1:health",
+  "title": "RuntimeSession.health result",
+  "description": "liveness: session, package resources and configuration only. readiness: also bounded read-only backend reads. Neither calls a model or writes; provider_calls and state_mutated state that design and a runner must measure them itself. `unverified` lists components whose status is UNKNOWN.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_version", "contract_version", "level", "status", "measured_at", "checks", "unverified", "provider_calls", "state_mutated"],
+  "properties": {
+    "api_version": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/api_version"},
+    "contract_version": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/observation_version"},
+    "level": {"enum": ["liveness", "readiness"]},
+    "status": {"enum": ["OK", "DEGRADED", "NOT_READY"]},
+    "measured_at": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/timestamp"},
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["component", "status", "code", "detail"],
+        "properties": {
+          "component": {"type": "string", "minLength": 1},
+          "status": {"enum": ["OK", "DEGRADED", "NOT_READY", "UNSUPPORTED", "UNKNOWN"]},
+          "code": {"type": "string", "minLength": 1},
+          "detail": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "unverified": {"type": "array", "items": {"type": "string"}},
+    "provider_calls": {"const": 0},
+    "state_mutated": {"const": false}
+  }
+}

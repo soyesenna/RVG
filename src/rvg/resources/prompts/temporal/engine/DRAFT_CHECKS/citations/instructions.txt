@@ -1,0 +1,1 @@
+For every sentence in draft, do the evidence units named by that sentence's evidence_ids actually support all its factual assertions and qualifications? Are short_answer assertions also supported by the union of these cited units? IDs must bind to the matching evidence text; unrelated citations do not count.

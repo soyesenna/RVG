@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rvg:runtime-api:0.1:ingest_result",
+  "title": "RuntimeSession.ingest result",
+  "description": "Per revision: STORED (a new event), DUPLICATE (the same bytes were stored), REJECTED (a rule refused it; nothing changed), ERROR (the backend failed). Commit, vectors and index view are separate readiness values; a value the runtime does not know is UNKNOWN or null.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_version", "operation", "tenant", "results", "knowledge_seq", "vectors", "readiness"],
+  "properties": {
+    "api_version": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/api_version"},
+    "operation": {"const": "ingest"},
+    "tenant": {"type": "string", "minLength": 1},
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["document_id", "revision", "outcome", "reason", "event_seq", "access"],
+        "properties": {
+          "document_id": {"type": ["string", "null"]},
+          "revision": {"type": ["integer", "null"]},
+          "outcome": {"enum": ["STORED", "DUPLICATE", "REJECTED", "ERROR"]},
+          "reason": {"type": ["string", "null"]},
+          "event_seq": {"type": ["integer", "null"]},
+          "access": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/access_change"}
+        }
+      }
+    },
+    "knowledge_seq": {"type": "integer", "minimum": 0},
+    "vectors": {
+      "type": "object",
+      "required": ["requested", "space", "status"],
+      "properties": {
+        "requested": {"type": "boolean"},
+        "space": {"type": ["string", "null"]},
+        "status": {"enum": ["NOT_REQUESTED", "DONE", "FAILED", "NO_EMBEDDING"]},
+        "pending": {"type": "integer", "minimum": 0},
+        "error": {"type": "string"},
+        "report": {"type": "object"}
+      }
+    },
+    "readiness": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/readiness_set"}
+  }
+}

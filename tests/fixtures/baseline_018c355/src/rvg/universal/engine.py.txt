@@ -1,0 +1,279 @@
+"""The one product path (Universal RVG): time-scoped retrieval → code validity rules → automatic
+scope → writer → the fixed controller → one bounded cascade step → FULL / PARTIAL / ABSTAIN /
+UNRESOLVED_SCOPE. Every constant comes from `configs/universal.json`; nothing here is chosen per
+knowledge base, language or request."""
+
+from __future__ import annotations
+
+from ..control import cascade
+from ..control.controller import AnswerController, ControlPolicy
+from ..control.verify import Asker
+from ..errors import ProviderError
+from ..gateway import DecisionGateway
+from ..storage.segments import unit_ranks
+from ..temporal.gate import select_evidence
+from .config import universal, universal_hash
+from .trace import node
+
+_U = universal()
+
+
+def validity_block(arm=None):
+    """The policy's validity block, with an experiment arm's overrides when one is given."""
+    return {**(_U.get("validity") or {}), **(dict(arm.validity) if arm is not None else {})}
+
+
+def validity_rules(arm=None):
+    """The policy's deterministic validity rules as `select_evidence` keyword arguments (U10:
+    the implicit-revision prior and its scope; the hard overlap rule stays off unless set; N2:
+    what an uncertain relation does when the prior's conditions hold, "prior" by default)."""
+    rules = validity_block(arm)
+    return {
+        "pairing": rules.get("pairing", "unit"),
+        "revision_overlap": rules.get("implicit_revision_overlap"),
+        "revision_prior": rules.get("implicit_revision_prior"),
+        "revision_prior_scope": rules.get("implicit_revision_prior_scope", "unit"),
+        "unknown_policy": rules.get("unknown_revision", "prior"),
+    }
+
+
+def prefer_latest_revision(ranked):
+    """U10-b: when several revisions of one family are all in force (the gate could not tell
+    them apart), that family's newest revision comes first in the writer's order, so a writer
+    that sees only the top of the list never sees the older text alone. Other units keep their
+    retrieval order (stable sort); the gate's validity decisions are untouched."""
+    stamp = lambda e: (e.get("published_at") or "", e.get("revision") or 0)
+    revisions, newest = {}, {}
+    for e in ranked:
+        revisions.setdefault(e["family"], set()).add(stamp(e))
+        newest[e["family"]] = max(newest.get(e["family"], stamp(e)), stamp(e))
+    older = lambda e: len(revisions[e["family"]]) > 1 and stamp(e) != newest[e["family"]]
+    return sorted(ranked, key=older)
+
+
+def interleave_revisions(ranked):
+    """U10-c: when several revisions of one family are all in force, their units are
+    interleaved (newest revision first, then the next, round-robin, each in retrieval order) at
+    the position of the family's first unit, so that any prefix of the list a writer sees holds
+    both revisions and a conflict between them is visible rather than resolved by order. Other
+    units keep their order; the gate's validity decisions are untouched."""
+    stamp = lambda e: (e.get("published_at") or "", e.get("revision") or 0)
+    by_family = {}
+    for e in ranked:
+        by_family.setdefault(e["family"], {}).setdefault(stamp(e), []).append(e)
+    mixed, emitted = {}, set()
+    for family, groups in by_family.items():
+        if len(groups) < 2:
+            continue
+        queues = [list(groups[s]) for s in sorted(groups, reverse=True)]
+        order = []
+        while any(queues):
+            for queue in queues:
+                if queue:
+                    order.append(queue.pop(0))
+        mixed[family] = order
+    out = []
+    for e in ranked:
+        if e["family"] not in mixed:
+            out.append(e)
+        elif e["family"] not in emitted:
+            emitted.add(e["family"])
+            out.extend(mixed[e["family"]])
+    return out
+
+
+class UniversalEngine:
+    def __init__(self, *, retriever, decision, writer, extractor, arm=None):
+        """`arm` is an experiment arm (`deepjev.universal.experiment.Arm`) that only an
+        evaluation runner passes; the product entry points never do."""
+        self.retriever, self.decision = retriever, decision
+        self.writer, self.extractor = writer, extractor
+        self.arm = arm
+        self.controller = AnswerController(decision, extractor, ControlPolicy())
+
+    def release_mode(self):
+        return dict(self.arm.release).get("mode", "current") if self.arm is not None else "current"
+
+    def conflict_partial(self):
+        """N4 (arm only): what a draft the floor blocked for conflict alone gets — "off" (the
+        policy) or "rewrite" (once in the conflict form, judged on its cited units)."""
+        return dict(self.arm.cascade).get("conflict_partial", "off") if self.arm else "off"
+
+    def writer_schema(self):
+        """N5 (arm only): the writing contract — "W0" (the policy's), "W1" structured, "W2"
+        structured with quotes bound to the unit text."""
+        return dict(self.arm.cascade).get("writer_schema", "W0") if self.arm else "W0"
+
+    async def units(self, tenant, question, text, k, context, gateway, *, at=None):
+        """Ranked evidence units in force at `question.as_of`, for a search text that may differ
+        from the question (the cascade's gap queries). Incomplete validity closure yields none.
+        `at` restricts the search to a knowledge snapshot (N3 snapshot release modes)."""
+        probe = question.model_copy(update={"text": text[:2000]})
+        snapshot_view = {"at": at} if at is not None else {}
+        with node("retrieve", {"text": probe.text, "k": k}) as n:
+            docs, retrieval = await self.retriever.search(
+                tenant,
+                probe,
+                context,
+                strategy=_U["retrieval"]["strategy"],
+                top_k=k,
+                expand=True,
+                **snapshot_view,
+            )
+            n.output(retrieval.get("seed_ids"))
+        with node("validity_gate", [d.key for d in docs]) as n:
+            evidence = await select_evidence(
+                docs,
+                question,
+                gateway=gateway,
+                threshold=_U["floor"]["threshold"],
+                margin=_U["floor"]["margin"],
+                **validity_rules(self.arm),
+            )
+            n.output(lambda: evidence.audit())
+        if not evidence.complete:
+            return [], evidence, retrieval
+        order = {key: rank for rank, key in enumerate(retrieval["seed_ids"])}
+        by_unit = unit_ranks(docs, retrieval["seed_ids"], probe.text)  # K8-1: segment rows
+        ranked = sorted(
+            evidence.active,
+            key=lambda e: (
+                *by_unit.get(
+                    e["id"], (order.get(f"{e['document_id']}@{e['revision']}", len(order)), 0.0)
+                ),
+                e["id"],
+            ),
+        )
+        rules = validity_block(self.arm)
+        if rules.get("prefer_latest_revision"):
+            ranked = prefer_latest_revision(ranked)
+        if rules.get("coexisting_revisions") == "interleave":
+            ranked = interleave_revisions(ranked)
+        return ranked, evidence, retrieval
+
+    async def answer(self, tenant, question, context, *, _retried=False):
+        storage = self.retriever.storage
+        store = storage.state
+        snapshot = store.snapshot(tenant)
+        mode = self.release_mode()
+        at = snapshot if mode != "current" else None
+        gateway = DecisionGateway(self.decision, context)
+        audits, families = [], set()
+
+        async def retrieve(text, k):
+            ranked, evidence, retrieval = await self.units(
+                tenant, question, text, k, context, gateway, at=at
+            )
+            families.update(u.get("family") for u in evidence.units.values())
+            audits.append({"query": text, "gate": evidence.audit(), "retrieval": retrieval})
+            return ranked
+
+        try:
+            with node("answer", {"tenant": tenant, "question": question.model_dump(mode="json")}):
+                result = await cascade.run(
+                    question,
+                    retrieve=retrieve,
+                    writer=self.writer,
+                    controller=self.controller,
+                    asker=Asker(self.decision, context),
+                    context=context,
+                    extractor=self.extractor,
+                    conflict_partial=self.conflict_partial(),
+                    writer_schema=self.writer_schema(),
+                )
+        except ProviderError as exc:
+            # A failed store, provider, schema or budget is ERROR, never a silent ABSTAIN; the
+            # stage it failed in is not guessed (the trace's failed node shows it).
+            result = {
+                **cascade.abstain(exc.code),
+                "status": "ERROR",
+                "stage": None,
+                "error": {
+                    "type": type(exc).__name__,
+                    "code": exc.code,
+                    "http_status": exc.status,
+                    "detail": exc.detail,
+                },
+            }
+        failed = [
+            (n, (result.get("trace") or {}).get(key) or {})
+            for n, key in ((1, "first"), (2, "second"))
+            if ((result.get("trace") or {}).get(key) or {}).get("status") == "ERROR"
+        ]
+        if result["status"] == "ABSTAIN" and failed:
+            # A stage failed and nothing was released: that is a failure, not an abstention.
+            # Nothing released changes; only the status names what happened.
+            stage, _ = failed[0]
+            result = {
+                **result,
+                "status": "ERROR",
+                "abstain_reason": result.get("reason"),
+                "reason": "stage_failed",
+                "error": {"stage": stage, "codes": [s.get("reason") for _, s in failed]},
+            }
+        if result["status"] in ("FULL", "PARTIAL"):
+            # N3 (all modes): at the release instant none of the answer's documents is revoked
+            # and the principal may see all of them; the check is the linearisation point.
+            documents = {u.split("@")[0] for u in result.get("evidence_ids") or []}
+            auth = storage.release.authorize(tenant, documents, self.retriever.principal)
+            if not auth.ok:
+                result = {
+                    **cascade.abstain(auth.reason),
+                    "stage": result.get("stage", 0),
+                    "blocked_documents": list(auth.blocked),
+                }
+            else:
+                result = {
+                    **result,
+                    "release": {
+                        "mode": mode,
+                        "knowledge_snapshot": snapshot,
+                        "revocation_seq": auth.revocation_seq,
+                        "acl_epoch": auth.acl_epoch,
+                    },
+                }
+        if mode == "current" and result["status"] != "ERROR" and store.snapshot(tenant) != snapshot:
+            # The sources moved while the answer was being made: nothing is released.
+            result = {**cascade.abstain("source_changed"), "stage": result.get("stage", 0)}
+        elif (
+            mode == "latest_at_release"
+            and result["status"] in ("FULL", "PARTIAL")
+            and await self.moved(tenant, question, context, snapshot, families, audits)
+        ):
+            if _retried:  # at most one fresh attempt, the same bound for every store
+                result = {**cascade.abstain("stale_after_retry"), "stage": result.get("stage", 0)}
+            else:
+                again = await self.answer(tenant, question, context, _retried=True)
+                return again | {"retried_after_change": True}
+        return {
+            **result,
+            "as_of": question.as_of.isoformat(),
+            "known_at": question.known_at.isoformat(),
+            "snapshot": snapshot,
+            "config_hash": universal_hash(),
+            "arm": self.arm.stamp() if self.arm is not None else None,
+            "storage": storage.describe(),
+            "audit": audits,
+        }
+
+    async def moved(self, tenant, question, context, snapshot, families, audits):
+        """A relevant change since `snapshot` (latest_at_release): an insert or revocation in a
+        family the answer retrieved, or a first search that now returns other seeds or other
+        documents. No model call: the question's vector is reused."""
+        store = self.retriever.storage.state
+        if store.snapshot(tenant) == snapshot:
+            return False
+        if store.changed_families(tenant, snapshot) & families:
+            return True
+        first = (audits or [{}])[0].get("retrieval") or {}
+        _, now = await self.retriever.search(
+            tenant,
+            question,
+            context,
+            strategy=_U["retrieval"]["strategy"],
+            top_k=_U["retrieval"]["candidates"],
+            expand=True,
+        )
+        return now.get("seed_ids") != first.get("seed_ids") or now.get("documents") != first.get(
+            "documents"
+        )

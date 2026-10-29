@@ -1,0 +1,120 @@
+"""The public surface of RVG: what an application, a research runner or a benchmark submission
+adapter imports. Every name is an existing runtime object re-exported, or a read-only view of
+the policy and of what this build actually supports; nothing here re-implements an answer.
+
+Composition is explicit: a caller builds the providers (`decision_provider`, `generation_provider`,
+`embedding_provider` from `Settings`, or its own objects with the same methods), opens a
+deployment (`open_storage` or `TemporalStore`), and hands them to `UniversalEngine`. A missing
+provider is a configuration error; nothing falls back to another provider or to a network API.
+A principal comes from the caller's trusted auth context (`TemporalRetriever(principal=...)`),
+never from the request text."""
+
+from __future__ import annotations
+
+import copy
+import importlib.util
+
+from . import __version__
+from .config import Settings, load_settings
+from .errors import BudgetExceeded, ConfigurationError, ContractError, ProviderError
+from .factory import decision_provider, embedding_provider, generation_provider
+from .runtime import CallContext
+from .storage import Storage, StorageConfig, load_config, open_storage
+from .temporal.access import TrustedPrincipal
+from .temporal.models import AnswerDraft, TemporalDocument, TemporalQuestion
+from .temporal.store import TemporalRetriever, TemporalStore
+from .transport import JsonTransport
+from .universal import universal, universal_hash
+from .universal.engine import UniversalEngine
+
+__all__ = [
+    "AnswerDraft",
+    "BudgetExceeded",
+    "CallContext",
+    "ConfigurationError",
+    "ContractError",
+    "JsonTransport",
+    "ProviderError",
+    "Settings",
+    "Storage",
+    "StorageConfig",
+    "TemporalDocument",
+    "TemporalQuestion",
+    "TemporalRetriever",
+    "TemporalStore",
+    "TrustedPrincipal",
+    "UniversalEngine",
+    "capabilities",
+    "decision_provider",
+    "embedding_provider",
+    "generation_provider",
+    "load_config",
+    "load_settings",
+    "open_storage",
+    "policy",
+    "policy_hash",
+]
+
+STATUSES = ("FULL", "PARTIAL", "ABSTAIN", "UNRESOLVED_SCOPE", "ERROR")
+
+
+def policy() -> dict:
+    """A copy of the one adopted policy (`rvg/resources/policies/universal.json`)."""
+    return copy.deepcopy(universal())
+
+
+def policy_hash() -> str:
+    """sha256 of the policy file's bytes; stamped on every answer as `config_hash`."""
+    return universal_hash()
+
+
+def capabilities() -> dict:
+    """What this build contains and how far each part has been verified. A status names the
+    strongest evidence recorded for that component and `evidence` says where it comes from
+    (docs/capabilities.md); a component that is not implemented says so instead of being
+    served by another one. This is a static description of the build: it opens no connection."""
+
+    def cap(status, evidence):
+        return {"status": status, "evidence": evidence}
+
+    before = "research repository before extraction, same source bytes"
+    return {
+        "package": {"distribution": "rvg-runtime", "version": __version__},
+        "policy": {"sha256": universal_hash(), "version": universal()["version"]},
+        "statuses": list(STATUSES),
+        "release_modes": {
+            "current": cap("ADOPTED", "default of every engine"),
+            "as_of_snapshot": cap("EXPERIMENTAL_ARM", "evaluation runners only"),
+            "latest_at_release": cap("EXPERIMENTAL_ARM", "evaluation runners only; N3L-2 REJECT"),
+        },
+        "state_stores": {
+            "sqlite": cap("TESTED_REAL_BACKEND", "RVG test suite"),
+            "postgres": cap("TESTED_REAL_BACKEND", "RVG test suite with a PostgreSQL server"),
+        },
+        "vector_indexes": {
+            "local_exact": cap("ADOPTED", "default; RVG test suite, N0 replay"),
+            "local_exact_incremental": cap("EXPERIMENTAL", "opt-in layout (N1F-2)"),
+            "pgvector": cap("TESTED_REAL_BACKEND", "RVG test suite with pgvector"),
+            "qdrant": cap("TESTED_REAL_BACKEND", "RVG test suite with Qdrant (REST)"),
+            "approximate": cap("NOT_IMPLEMENTED", "no ANN index"),
+        },
+        "decision_providers": {
+            "openrouter_jev": cap("TESTED_LIVE", before),
+            "vercel_gateway_jev": cap("TESTED_OFFLINE", "wire-format tests"),
+            "typesafe_direct_jev": cap("TESTED_OFFLINE", "wire-format tests"),
+            "mock": cap("TESTED_OFFLINE", "RVG test suite"),
+            "local_judge": cap("NOT_IMPLEMENTED", "no local semantic judge"),
+        },
+        "generation_providers": {
+            "openrouter": cap("TESTED_LIVE", before),
+            "mock": cap("TESTED_OFFLINE", "RVG test suite"),
+        },
+        "embedding_providers": {
+            "openrouter": cap("TESTED_LIVE", before),
+            "mock": cap("TESTED_OFFLINE", "RVG test suite"),
+        },
+        "record_replay": cap("TESTED_OFFLINE", "RVG test suite; N0 tape replay 120/120"),
+        "optional_dependencies": {
+            "postgres": importlib.util.find_spec("psycopg") is not None,
+        },
+    }

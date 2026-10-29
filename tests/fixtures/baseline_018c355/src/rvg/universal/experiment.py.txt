@@ -1,0 +1,73 @@
+"""Experiment arms (N-series): a named override of part of the policy, handed by an evaluation
+runner to the engine's constructor. A runtime request cannot carry one, the product CLI never
+builds one, and every answer made under an arm is stamped with its name and hash. Adopting an arm
+means writing its values into `configs/universal.json` (a new policy hash), not running it."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from .trace import canonical_hash
+
+# Only these policy keys may be overridden by an arm; anything else is refused.
+OVERRIDABLE = {
+    "validity": {
+        "implicit_revision_prior",
+        "implicit_revision_prior_scope",
+        "unknown_revision",
+        "coexisting_revisions",
+    },
+    "release": {"mode"},
+    "cascade": {"conflict_partial", "writer_schema"},
+}
+RELEASE_MODES = ("current", "as_of_snapshot", "latest_at_release")
+CONFLICT_PARTIAL = ("off", "rewrite")
+WRITER_SCHEMAS = ("W0", "W1", "W2")
+
+
+@dataclass(frozen=True)
+class Arm:
+    name: str
+    validity: tuple[tuple[str, object], ...] = ()
+    release: tuple[tuple[str, object], ...] = ()
+    cascade: tuple[tuple[str, object], ...] = ()
+
+    def __post_init__(self):
+        unknown = {k for k, _ in self.validity} - OVERRIDABLE["validity"]
+        unknown |= {k for k, _ in self.release} - OVERRIDABLE["release"]
+        unknown |= {k for k, _ in self.cascade} - OVERRIDABLE["cascade"]
+        if unknown or not self.name.strip():
+            raise ValueError(f"arm_override_not_allowed:{sorted(unknown)}")
+        if dict(self.release).get("mode", "current") not in RELEASE_MODES:
+            raise ValueError("unknown_release_mode")
+        if dict(self.cascade).get("conflict_partial", "off") not in CONFLICT_PARTIAL:
+            raise ValueError("unknown_conflict_partial")
+        if dict(self.cascade).get("writer_schema", "W0") not in WRITER_SCHEMAS:
+            raise ValueError("unknown_writer_schema")
+
+    @classmethod
+    def of(cls, name, *, validity=None, release=None, cascade=None):
+        return cls(
+            name,
+            tuple(sorted((validity or {}).items())),
+            tuple(sorted((release or {}).items())),
+            tuple(sorted((cascade or {}).items())),
+        )
+
+    @property
+    def digest(self):
+        body = {"name": self.name, "validity": dict(self.validity), "release": dict(self.release)}
+        if self.cascade:  # absent for older arms, so their hashes stay as recorded
+            body["cascade"] = dict(self.cascade)
+        return canonical_hash(body)
+
+    def stamp(self):
+        out = {
+            "name": self.name,
+            "hash": self.digest,
+            "validity": dict(self.validity),
+            "release": dict(self.release),
+        }
+        if self.cascade:
+            out["cascade"] = dict(self.cascade)
+        return out

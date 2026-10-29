@@ -1,0 +1,1 @@
+newer explicitly corrects, cancels or replaces this unit's assertion within the same scope and time. It states that this older value no longer applies.

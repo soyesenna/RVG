@@ -1,0 +1,25 @@
+{
+  "tenant_id": "fixture-tenant",
+  "document_id": "fixture-doc",
+  "unit_id": "fixture-unit",
+  "revision_id": "fixture-v1",
+  "content_hash": "7d902d93ee1b2ae2202be9478ec107872755a0028d73db44c9f75b4e0a7bb375",
+  "text": "이 문장은 형식 검사를 위한 가상 근거다. 적용 한도는 100이다.",
+  "source_uri": "fixture://document/1",
+  "source_title": "가상 문서",
+  "section_path": [
+    "한도"
+  ],
+  "span": {
+    "offset_unit": "unicode_codepoint",
+    "start": 0,
+    "end": 37
+  },
+  "family_id": "fixture-family",
+  "family_provenance": "source_document_id",
+  "observed_at": "2026-09-23T00:00:00Z",
+  "published_at": null,
+  "effective_from": null,
+  "effective_to": null,
+  "permission_epoch": 1
+}

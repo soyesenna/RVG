@@ -1,0 +1,2 @@
+# Prompt texts are exact bytes checked against a sha256 manifest: no end-of-line conversion.
+src/rvg/resources/prompts/** -text

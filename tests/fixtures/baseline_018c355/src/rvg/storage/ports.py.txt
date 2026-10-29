@@ -1,0 +1,136 @@
+"""The storage ports of the product path (PORT-0).
+
+The engine and the retriever reach knowledge only through these contracts; a deployment chooses
+the implementations (`deepjev.storage.factory`). Which backend is used is a deployment choice,
+never a knowledge-base, domain or language choice, and it never changes the semantic policy
+(`configs/universal.json`).
+
+- `KnowledgeStateStore`: the authoritative record — documents and their immutable revisions,
+  revocations, ACL, the commit-ordered event ledger and the release check.
+- `VectorBlobStore`: canonical vector bytes (float64, little-endian) per embedding space and
+  input hash.
+- `VectorIndexPort`: candidate search over the vectors of eligible documents, with its precision
+  class declared (`EXACT_CANONICAL`, `EXACT_NATIVE`, `APPROXIMATE`).
+- `ReleaseCoordinator` (`deepjev.storage.release`): the fence at which an answer is published.
+
+No connection, cursor, row id, SDK object or file path crosses these ports."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Iterator
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
+
+import numpy as np
+
+EXACT_CANONICAL = "EXACT_CANONICAL"  # canonical float64 vectors, exhaustive, key-order ties
+EXACT_NATIVE = "EXACT_NATIVE"  # exhaustive over the backend's own stored representation
+APPROXIMATE = "APPROXIMATE"  # may miss true top-k candidates (ANN)
+
+
+@dataclass(frozen=True)
+class Generations:
+    """A tenant's generation counters, read together. `knowledge_seq` is the knowledge snapshot
+    of N3 (inserts and revocations); `document_seq` moves on inserts only (the catalog),
+    `revocation_seq` on revocations only (a per-query mask), `acl_epoch` on ACL changes. None of
+    them is a backend row id; each is a per-tenant, commit-ordered, increasing number."""
+
+    knowledge_seq: int
+    document_seq: int
+    revocation_seq: int
+    acl_epoch: int
+
+
+@dataclass(frozen=True)
+class CatalogRows:
+    """One consistent read: the generations and every document revision of a tenant as
+    `(document_id, revision, inserted_seq or None)` (None: written before event numbers)."""
+
+    generations: Generations
+    rows: tuple
+
+
+@dataclass
+class VectorScan:
+    """One consistent read of a tenant's vectors in one space, ordered by input hash: rows of
+    `(input_hash, dims, payload)` where the payload is float64 little-endian bytes (binary) or a
+    JSON list (the legacy format, read only by benchmark arms)."""
+
+    vector_seq: int
+    count: int
+    rows: Iterator
+    source: str = "binary"
+
+
+@runtime_checkable
+class KnowledgeStateStore(Protocol):
+    def describe(self) -> dict: ...
+
+    def upsert(self, tenant: str, document) -> int: ...
+
+    def revoke(self, tenant: str, document_id: str) -> None: ...
+
+    def set_access(self, tenant: str, document_id: str, principal: str, effect) -> None: ...
+
+    def snapshot(self, tenant: str) -> int: ...
+
+    def generations(self, tenant: str) -> Generations: ...
+
+    def acl_epoch(self, tenant: str) -> int: ...
+
+    def catalog_rows(self, tenant: str) -> CatalogRows: ...
+
+    def bodies(self, tenant: str, keys: Iterable[tuple[str, int]]) -> dict: ...
+
+    def documents(self, tenant: str, *, known_at=None, allowed_ids=None, at=None) -> list: ...
+
+    def revoked(self, tenant: str, *, at=None) -> set: ...
+
+    def hidden(self, tenant: str, principal) -> set: ...
+
+    def changed_families(self, tenant: str, since: int) -> set: ...
+
+    def authorize_release(self, tenant: str, document_ids, principal): ...
+
+    def events(self, tenant: str, since: int = 0) -> list: ...
+
+    def digest(self, tenant: str, space: str | None = None) -> str: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class VectorBlobStore(Protocol):
+    def put_vector(self, tenant: str, space: str, text: str, vector) -> bool: ...
+
+    def vector(self, tenant: str, space: str, text: str) -> np.ndarray | None: ...
+
+    def has_vectors(self, tenant: str, space: str, hashes: Iterable[str]) -> set: ...
+
+    def vector_seq(self, tenant: str, space: str) -> int: ...
+
+    def scan_vectors(
+        self, tenant: str, space: str, *, source: str = "binary"
+    ) -> AbstractContextManager[VectorScan]: ...
+
+    def scan_changes(
+        self, tenant: str, space: str, since: int
+    ) -> AbstractContextManager[VectorScan]: ...
+
+
+class IndexView(Protocol):
+    """The index as seen by one query: per catalog row, whether it can be ranked now and whether
+    its stored vector is malformed; `rank` returns catalog rows and scores in rank order."""
+
+    has_vector: np.ndarray
+    invalid: np.ndarray
+    generation: dict
+
+    def rank(self, mask: np.ndarray, query: np.ndarray, top_k: int): ...
+
+
+class VectorIndexPort(Protocol):
+    def capabilities(self) -> dict: ...
+
+    async def view(self, tenant: str, space: str, dims: int, catalog, *, run=None) -> IndexView: ...

@@ -1,0 +1,100 @@
+[build-system]
+# Exact: the wheel records its generator's version, so another hatchling gives other wheel bytes
+# (0.1.0, parent PUB-2). Its own dependencies do not reach the files.
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[project]
+# Distribution name on PyPI; the import name is `rvg`.
+name = "rvg-runtime"
+version = "0.1.0"
+description = "Retrieval-Verified Generation (RVG): answers from permitted, in-force knowledge-base evidence under a release contract — a fixed controller releases only verified text (FULL or PARTIAL) and hands the rest off (ABSTAIN)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Jooyoung Kim", email = "kjy915875@gmail.com" }]
+keywords = [
+    "retrieval-augmented generation",
+    "RAG",
+    "verification",
+    "attribution",
+    "question answering",
+    "knowledge base",
+    "LLM",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Linguistic",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.28,<1",
+    "numpy>=2,<3",
+    "pydantic>=2.7,<3",
+    "pydantic-settings>=2.10,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/soyesenna/RVG"
+Repository = "https://github.com/soyesenna/RVG"
+Changelog = "https://github.com/soyesenna/RVG/blob/main/CHANGELOG.md"
+Issues = "https://github.com/soyesenna/RVG/issues"
+
+[project.scripts]
+rvg = "rvg.cli:main"
+
+[project.optional-dependencies]
+# PostgreSQL state store and the pgvector index adapter. Qdrant uses its REST API through httpx.
+postgres = [
+    "psycopg[binary]>=3.2,<4",
+]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.100,<7",
+    "jsonschema>=4.23,<5",
+    "pytest>=8,<10",
+    "ruff>=0.12,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rvg"]
+
+[tool.hatch.build.targets.sdist]
+# Anchored at the project root ("/"): an unanchored name would also match a nested file of the
+# same name (e.g. release/public/CHANGELOG.md, the public tree's replacement).
+include = [
+    "/src/rvg",
+    "/tests",
+    "/docs",
+    "/examples",
+    "/scripts",
+    "/README.md",
+    "/README.ko.md",
+    "/CHANGELOG.md",
+    "/CONTRIBUTING.md",
+    "/SECURITY.md",
+    "/SECURITY.ko.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/.env.example",
+    "/pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+# Code blocks in Markdown are illustrations, not formatted code.
+extend-exclude = ["*.md"]

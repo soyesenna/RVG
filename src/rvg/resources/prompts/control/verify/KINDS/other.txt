@@ -1,0 +1,1 @@
+question asks for a single fact, entity, value or description

@@ -1,0 +1,1 @@
+taking sentences as true, they establish answer as exactly the item question asks for.

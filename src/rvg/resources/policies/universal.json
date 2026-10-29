@@ -1,0 +1,84 @@
+{
+  "version": "universal-v1",
+  "note": "The one policy every knowledge base and every language runs under. Nothing here may be chosen per knowledge base, per language or per request; the hash of this file is stamped on every output. Changing a value is a global change that goes through the U-series protocols.",
+  "models": {
+    "decision": "typesafe/jev-1.14",
+    "writer": "claude-haiku-5-5",
+    "extractor": "claude-haiku-5-5",
+    "generation_provider": "claude_code",
+    "embedding": "google/gemini-embedding-2",
+    "embedding_dimensions": 3072
+  },
+  "retrieval": {
+    "strategy": "dense",
+    "lexical": "word",
+    "candidates": 20,
+    "write_top": 3,
+    "widen_top": 10,
+    "byte_budget": 18000,
+    "min_units": 4,
+    "rrf_k": 60
+  },
+  "floor": {
+    "threshold": 0.85,
+    "margin": 0.15,
+    "conflict_floor": 0.5,
+    "answer_threshold": 0.85,
+    "dependency_threshold": 0.5,
+    "rewrite_refute_floor": 0.5
+  },
+  "profile": {
+    "*": {
+      "answered": 0.84,
+      "qualifiers": 0.3,
+      "qualifiers_relative": 0.3
+    }
+  },
+  "controller": {
+    "path": "direct",
+    "form": "choice",
+    "scope": "full",
+    "partial_form": "choice",
+    "partial_scope": "minimal",
+    "partial": true,
+    "recover": true,
+    "closure_on_full": true,
+    "qualifier_scope": "unit"
+  },
+  "cascade": {
+    "policy": "widen",
+    "widen": 1,
+    "gap_queries": 2,
+    "max_decision_calls": 12,
+    "answerable_gate": null,
+    "consistency": {"partner": "widened", "judge": "same_text", "theta": 0.7},
+    "evidence_window": "neighbors-v1",
+    "scope_top1": "dual-draft-v1"
+  },
+  "validity": {
+    "implicit_revision_overlap": null,
+    "implicit_revision_prior": 0.8,
+    "implicit_revision_prior_scope": "document",
+    "prefer_latest_revision": false,
+    "coexisting_revisions": "interleave"
+  },
+  "release": {
+    "mode": "scoped_dependency",
+    "vectors": "scoped",
+    "vector_moves": "after_check",
+    "acl_moves": "after_check",
+    "retry": 1,
+    "retry_rule": "slack",
+    "revalidate": false
+  },
+  "scope": {
+    "k": 5,
+    "tau": 0.4,
+    "dominance": 2.0,
+    "rrf": 60,
+    "candidates": 3,
+    "self_contained_cut": 0.5,
+    "unresolved_status": false
+  },
+  "statuses": ["FULL", "PARTIAL", "ABSTAIN", "UNRESOLVED_SCOPE", "ERROR"]
+}

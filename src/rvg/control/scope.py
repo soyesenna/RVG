@@ -1,0 +1,59 @@
+"""Automatic scope resolution from what retrieval itself surfaces (Universal RVG P3).
+
+An anchor is a unit's provenance as its title (company and filing, article title, ...), kept by
+the ingest rule of U1; nothing here knows any knowledge base. When the top of the ranking
+concentrates on one anchor the scope is that anchor (experiment X-1's decider A, constants fixed
+once in `rvg/resources/policies/universal.json`). When the question does not name its target and no anchor
+dominates, the scope is unresolved and the answer is `UNRESOLVED_SCOPE` — no guess is made and
+no person is asked on the required path."""
+
+from __future__ import annotations
+
+from ..universal import universal
+
+_S = universal()["scope"]
+
+
+def anchor_of(unit):
+    return (unit.get("title") or "").strip()
+
+
+def anchor_shares(units, *, k=None, rrf=None):
+    """Rank-weighted share of each anchor among the top-k units; units without one still weigh."""
+    k, rrf = k or _S["k"], rrf or _S["rrf"]
+    total, own = 0.0, {}
+    for rank, unit in enumerate(units[:k], start=1):
+        weight = 1.0 / (rrf + rank)
+        total += weight
+        anchor = anchor_of(unit)
+        if anchor:
+            own[anchor] = own.get(anchor, 0.0) + weight
+    ranked = sorted(own.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [(anchor, share / total) for anchor, share in ranked] if total else []
+
+
+def dominant(shares, *, tau=None, dominance=None):
+    """The one anchor that holds at least tau of the weight and twice the runner-up's, or None."""
+    tau, dominance = tau or _S["tau"], dominance or _S["dominance"]
+    if not shares or shares[0][1] < tau:
+        return None
+    if len(shares) > 1 and shares[0][1] < dominance * shares[1][1]:
+        return None
+    return shares[0][0]
+
+
+def resolve(units, self_contained):
+    """RESOLVED (one anchor dominates), UNRESOLVED (the question points at something it does not
+    name and the ranking is spread over anchors) or OPEN (proceed unrestricted)."""
+    shares = anchor_shares(units)
+    anchor = dominant(shares)
+    candidates = [a for a, _ in shares[: _S["candidates"]]]
+    if anchor is not None:
+        return {"status": "RESOLVED", "anchor": anchor, "candidates": candidates}
+    if shares and self_contained is not None and self_contained < _S["self_contained_cut"]:
+        return {"status": "UNRESOLVED", "anchor": None, "candidates": candidates}
+    return {"status": "OPEN", "anchor": None, "candidates": candidates}
+
+
+def restrict(units, anchor):
+    return [u for u in units if anchor_of(u) == anchor]

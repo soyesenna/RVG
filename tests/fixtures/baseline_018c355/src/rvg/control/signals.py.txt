@@ -1,0 +1,79 @@
+"""The controller's measured signals and the release rule over them.
+
+A record is one judged draft: {"group": str, "eligible": bool, "scores": {signal: float | None}}.
+`eligible` carries the floor that never moves (claim gate, dependency closure). Thresholds map a
+group ("*" for all) to {signal: value}; 0 switches a check off. The product applies exactly one
+threshold map, the universal profile in `configs/universal.json`; the diagnostics package learns
+and certifies maps offline for reporting only."""
+
+from __future__ import annotations
+
+from .verify import relative
+
+ANY = "*"
+SIGNALS = (
+    "answered",
+    "citations",
+    "substance",
+    "substance_answering",
+    "qualifiers",
+    "qualifiers_dropped",
+    "qualifiers_relative",
+    "qualifiers_dropped_relative",
+    "fits",
+    "follows",
+)
+PER_SENTENCE = SIGNALS[2:8]
+
+
+def sentence_scores(measured, relations, answer_threshold):
+    """Per-sentence value of every sentence-level signal; None means the sentence is exempt."""
+    substance, kept, dropped = (
+        measured.get(k) for k in ("substance", "qualifiers", "qualifiers_dropped")
+    )
+    n = max((len(v) for v in (substance, kept, dropped) if v), default=0)
+    blank = [None] * n
+    substance, kept, dropped = substance or blank, kept or blank, dropped or blank
+    # Without requested items there is nothing to restrict the substance check to.
+    answering = [
+        not relations or max(relations["answers"][i]) >= answer_threshold for i in range(n)
+    ]
+    pairs = lambda own, control: [
+        relative(a, b) or 0.0 for a, b in zip(own, measured.get(control) or blank, strict=True)
+    ]
+    return {
+        "substance": [v or 0.0 for v in substance],
+        "substance_answering": [
+            (v or 0.0) if on else None for v, on in zip(substance, answering, strict=True)
+        ],
+        "qualifiers": [v or 0.0 for v in kept],
+        "qualifiers_dropped": [v or 0.0 for v in dropped],
+        "qualifiers_relative": pairs(kept, "control_kept"),
+        "qualifiers_dropped_relative": pairs(dropped, "control_dropped"),
+    }
+
+
+def draft_scores(measured, relations, answer_threshold):
+    """One score per signal for a whole draft: a sentence-level check is its weakest sentence."""
+    rows = sentence_scores(measured, relations, answer_threshold)
+    scores = {
+        name: min((v for v in values if v is not None), default=0.0)
+        for name, values in rows.items()
+    }
+    for name in ("answered", "citations", "fits", "follows"):
+        scores[name] = measured.get(name) or 0.0
+    return {name: scores[name] for name in SIGNALS}
+
+
+def released(record, thresholds):
+    if not record["eligible"]:
+        return False
+    own = thresholds.get(record.get("group"), thresholds.get(ANY))
+    if own is None:
+        return False
+    return all(t <= 0 or (record["scores"].get(s) or 0.0) >= t for s, t in own.items())
+
+
+def tally(records, thresholds):
+    out = [r for r in records if released(r, thresholds)]
+    return len(out), sum(bool(r["wrong"]) for r in out)

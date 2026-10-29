@@ -1,0 +1,1 @@
+ CONFLICT FORM: for a requested item where sources of equal authority give different values, do NOT leave the item out and do NOT choose: write one sentence per value, each naming its source (the evidence title) and citing only the evidence ID that states that value, and set short_answer to the values joined by ' | '. Items the sources agree on are written as usual.

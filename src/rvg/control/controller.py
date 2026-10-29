@@ -1,0 +1,615 @@
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+
+from ..errors import ProviderError
+from ..temporal.engine import extract_claims
+from ..temporal.models import AnswerDraft
+from ..universal import universal
+from ..universal.trace import node
+from .compose import compose, decompose, relate
+from .repair import rewrite_extractive
+from .signals import ANY, PER_SENTENCE, SIGNALS, draft_scores, sentence_scores
+from .verify import (
+    Asker,
+    answer_checks,
+    direct_checks,
+    draft_checks,
+    judge_claims,
+    judge_minimal,
+    label,
+    question_kind,
+    reference_sentence,
+    refute_score,
+    sentence_coverage,
+    sentence_qualifiers,
+    sentence_substance,
+)
+
+_U = universal()
+_FLOOR, _CONTROLLER = _U["floor"], _U["controller"]
+# The one threshold map every knowledge base and language is released under. Checks it names
+# are the only auxiliary checks asked; a 0 or absent signal is never called.
+UNIVERSAL_PROFILE = {
+    group: {s: t for s, t in own.items() if t > 0} for group, own in _U["profile"].items()
+}
+if {s for own in UNIVERSAL_PROFILE.values() for s in own} - set(SIGNALS):
+    raise ValueError("unknown_profile_signal")
+
+
+@dataclass(frozen=True)
+class ControlPolicy:
+    """The gate never moves and the profile is universal (`rvg/resources/policies/universal.json`); only the
+    decision unit and the recovery/partial switches are configurable, and none of them per
+    knowledge base or language."""
+
+    # "direct" judges each written sentence as it stands; "extraction" first splits claims.
+    path: str = _CONTROLLER["path"]
+    # FULL is refused when a sentence rests on a requested item that nothing answers.
+    closure_on_full: bool = _CONTROLLER["closure_on_full"]
+    form: str = _CONTROLLER["form"]
+    scope: str = _CONTROLLER["scope"]
+    partial_form: str = _CONTROLLER["partial_form"]
+    partial_scope: str = _CONTROLLER["partial_scope"]
+    partial: bool = _CONTROLLER["partial"]
+    recover: bool = _CONTROLLER["recover"]
+    threshold: float = _FLOOR["threshold"]
+    margin: float = _FLOOR["margin"]
+    conflict_floor: float = _FLOOR["conflict_floor"]
+    answer_threshold: float = _FLOOR["answer_threshold"]
+    dependency_threshold: float = _FLOOR["dependency_threshold"]
+    rewrite_refute_floor: float = _FLOOR["rewrite_refute_floor"]
+    # Experiment W-5: what the qualifier checks see as the evidence. "unit" is the cited unit as
+    # written; "sentence" narrows it to the control sentence closest to the draft sentence.
+    qualifier_scope: str = _CONTROLLER["qualifier_scope"]
+    # U23 (arm only, parent docs/UNIVERSAL_U23_PROTOCOL.md §1): the profile's `answered` threshold
+    # for every group — None keeps the policy's, 0 drops the signal from the gate (it is still
+    # measured: the direct checks always run).
+    answered: float | None = None
+
+    @property
+    def gate(self):
+        return {
+            "threshold": self.threshold,
+            "margin": self.margin,
+            "conflict_floor": self.conflict_floor,
+        }
+
+    def limits(self):
+        out = {group: dict(own) for group, own in UNIVERSAL_PROFILE.items()}
+        if self.answered is not None:
+            for own in out.values():
+                if self.answered > 0:
+                    own["answered"] = self.answered
+                else:
+                    own.pop("answered", None)
+        return out
+
+
+async def skipped():
+    return None
+
+
+async def labelled(name, job):
+    """A concurrent check under its own trace node, so its calls have a call site that does not
+    depend on which check reached the network first (observation only)."""
+    with node(name, name):
+        return await job
+
+
+def summary(state):
+    """What the fixed gate decided about one draft, for the request record: per-claim labels,
+    the draft's signal scores against the universal profile, and the two release conditions."""
+    if "blocked" in state:
+        return {"blocked": state["blocked"]}
+    return {
+        "claims": state["claims"],
+        "labels": state["labels"],
+        "scores": state["scores"],
+        "kind": state["kind"],
+        "eligible": state["eligible"],
+        "accepted": state["accepted"],
+    }
+
+
+def detail(state, action=None):
+    """PROD-1 (handoff packet, observation only): what the fixed gate decided about one draft in a
+    form a reviewer can read — each claim with the sentence it belongs to, its cited units, its
+    label and the judge's probabilities; each profile signal against its threshold; the
+    sentence-level values of the thresholded signals; and the release conditions."""
+    if "blocked" in state:
+        return {"blocked": state["blocked"], "action": action}
+    group = state.get("group")
+    rows = state.get("rows") or {}
+    claims = []
+    for i, text in enumerate(state["claims"]):
+        value = state["values"][i] or {}
+        judged = {k: value[k] for k in ("probabilities", "s", "r", "error") if k in value}
+        claims.append(
+            {
+                "text": text,
+                "sentence": state["owner"][i],
+                "cited": list(state["cited"][i]),
+                "label": state["labels"][i],
+                **judged,
+            }
+        )
+    signals = {
+        name: {
+            "score": state["scores"].get(name),
+            "threshold": threshold,
+            "passed": (state["scores"].get(name) or 0.0) >= threshold,
+        }
+        for name, threshold in (group or {}).items()
+    }
+    return {
+        "claims": claims,
+        "signals": signals,
+        "sentence_signals": {name: list(rows[name]) for name in signals if name in rows},
+        "kind": state["kind"],
+        "certified_kind": group is not None,
+        "covered": state.get("covered"),
+        "dangling": state.get("dangling"),
+        "eligible": state["eligible"],
+        "accepted": state["accepted"],
+        "blocked": None,
+        "action": action,
+    }
+
+
+def claims_of(draft, extraction):
+    claims, owner, cited = [], [], []
+    union = sorted({i for s in draft.sentences for i in s.evidence_ids})
+    for group in sorted(extraction.sentences, key=lambda g: g.sentence_index):
+        for claim in group.claims:
+            claims.append(claim)
+            owner.append(group.sentence_index)
+            cited.append(list(draft.sentences[group.sentence_index].evidence_ids))
+    for claim in extraction.short_answer_claims:
+        claims.append(claim)
+        owner.append(None)
+        cited.append(union)
+    return claims, owner, cited
+
+
+class AnswerController:
+    """Domain-agnostic: evidence validity and permissions are decided upstream by code."""
+
+    def __init__(self, decision, generator, policy: ControlPolicy | None = None):
+        self.decision, self.generator = decision, generator
+        self.policy = policy or ControlPolicy()
+
+    async def _judge(self, context, question, evidence, claims, cited, form, scope, draft):
+        asker = Asker(self.decision, context)
+        if scope == "minimal":
+            values = await judge_minimal(asker, question, evidence, claims, cited, form=form)
+        else:
+            values = await judge_claims(
+                asker, question, evidence, claims, form=form, scope=scope, draft=draft
+            )
+        return [label(values[i], **self.policy.gate) for i in range(len(claims))], values
+
+    async def _assess(
+        self,
+        question,
+        evidence,
+        value,
+        context,
+        slots,
+        *,
+        previous=None,
+        everything=False,
+        judgements=None,
+    ):
+        """`judgements` (PROD-2 decision cache): the claim judgements a cached decision recorded
+        for this very draft on this very evidence; they are reused, labelled by the same gate,
+        instead of asking the judge again (direct path only, one judgement per claim)."""
+        draft = AnswerDraft.model_validate(value)
+        if any(not set(s.evidence_ids) <= {e["id"] for e in evidence} for s in draft.sentences):
+            return {"blocked": "citation_id_not_active"}
+        p, sentences = self.policy, [s.text for s in draft.sentences]
+        extraction = None
+        if p.path == "direct":
+            claims, owner = sentences, list(range(len(sentences)))
+            cited = [list(s.evidence_ids) for s in draft.sentences]
+        else:
+            extraction = await extract_claims(
+                self.generator, question, draft, context, previous=previous
+            )
+            if extraction is None:
+                return {"blocked": "missing_sentence_claims"}
+            claims, owner, cited = claims_of(draft, extraction)
+        if not claims or len(claims) > 24:
+            return {"blocked": "empty_or_excessive_claims"}
+        text = question.text if hasattr(question, "text") else question["text"]
+        by_id = {e["id"]: e for e in evidence}
+        own = [[by_id[i] for i in s.evidence_ids] for s in draft.sentences]
+        limits = p.limits()
+        wanted = set(SIGNALS) if everything else {s for group in limits.values() for s in group}
+        ask = lambda: Asker(self.decision, context)
+
+        async def related():
+            known = await slots if asyncio.isfuture(slots) else slots
+            if not known:
+                return None, None
+            return known, await relate(ask(), text, known, sentences)
+
+        controls = [
+            reference_sentence(t, e) or "" if e else "" for t, e in zip(sentences, own, strict=True)
+        ]
+        seen = own
+        if p.qualifier_scope == "sentence":
+            seen = [
+                [{**e[0], "text": c}] if e and c else e for e, c in zip(own, controls, strict=True)
+            ]
+        reuse = judgements is not None and p.path == "direct" and len(judgements) == len(claims)
+
+        async def reused():
+            values = dict(enumerate(judgements))
+            return [label(values[i], **self.policy.gate) for i in range(len(claims))], values
+
+        jobs = {
+            "checks": direct_checks(ask(), question, evidence, claims, value)
+            if p.path == "direct"
+            else draft_checks(ask(), question, evidence, claims, value),
+            "judged": reused()
+            if reuse
+            else self._judge(context, question, evidence, claims, cited, p.form, p.scope, value),
+            "related": related(),
+            # Only the checks a threshold is set for are asked at all.
+            "substance": sentence_substance(ask(), text, sentences)
+            if {"substance", "substance_answering"} & wanted
+            else skipped(),
+            "qualifiers": sentence_qualifiers(ask(), sentences, seen)
+            if {"qualifiers", "qualifiers_relative"} & wanted
+            else skipped(),
+            "qualifiers_dropped": sentence_qualifiers(ask(), sentences, seen, dropped_only=True)
+            if {"qualifiers_dropped", "qualifiers_dropped_relative"} & wanted
+            else skipped(),
+            "control_kept": sentence_qualifiers(ask(), controls, seen)
+            if "qualifiers_relative" in wanted
+            else skipped(),
+            "control_dropped": sentence_qualifiers(ask(), controls, seen, dropped_only=True)
+            if "qualifiers_dropped_relative" in wanted
+            else skipped(),
+            "answer": answer_checks(
+                ask(), text, draft.short_answer, sentences, only={"fits", "follows"} & wanted
+            )
+            if {"fits", "follows"} & wanted
+            else skipped(),
+            "kind": question_kind(ask(), text) if everything or set(limits) != {ANY} else skipped(),
+        }
+        found = dict(
+            zip(
+                jobs,
+                await asyncio.gather(*(labelled("check:" + k, j) for k, j in jobs.items())),
+                strict=True,
+            )
+        )
+        checks, (labels, values), (known, relations) = (
+            found["checks"],
+            found["judged"],
+            found["related"],
+        )
+        measured = {**checks, **(found["answer"] or {})} | {
+            k: found[k]
+            for k in (
+                "substance",
+                "qualifiers",
+                "qualifiers_dropped",
+                "control_kept",
+                "control_dropped",
+            )
+        }
+        scores = draft_scores(measured, relations, p.answer_threshold)
+        rows = sentence_scores(measured, relations, p.answer_threshold)
+        group = limits.get(found["kind"], limits.get(ANY)) or {}
+        if found["kind"] not in limits and ANY not in limits:
+            group = None  # no thresholds were certified for this kind of question
+        # Entailed is not informative, and supported is not faithful in scope: per sentence,
+        # for the partial fallback and the rewrite; the draft as a whole is held to `scores`.
+        passing = lambda names: [
+            group is not None
+            and all(
+                rows[n][i] is None or rows[n][i] >= group[n] for n in names if group.get(n, 0) > 0
+            )
+            for i in range(len(sentences))
+        ]
+        dangling = bool(
+            p.closure_on_full
+            and relations
+            and compose(
+                sentences,
+                list(range(len(sentences))),
+                relations,
+                known,
+                partial=True,
+                answer_threshold=p.answer_threshold,
+                dependency_threshold=p.dependency_threshold,
+            )["dropped_for_dependency"]
+        )
+        covered = p.path == "direct" or (checks.get("coverage") or 0) >= p.threshold
+        # The floor never moves: every claim supported, nothing resting on an unanswered item.
+        eligible = covered and all(v == "SUPPORTED" for v in labels) and not dangling
+        return {
+            "extraction": extraction.model_dump() if extraction else None,
+            "claims": claims,
+            "owner": owner,
+            "cited": cited,
+            "checks": checks,
+            "labels": labels,
+            "values": values,
+            "informative": passing(PER_SENTENCE[:2]),
+            "scoped": passing(PER_SENTENCE[2:]),
+            "slots": known,
+            "relations": relations,
+            "kind": found["kind"],
+            "scores": scores,
+            # PROD-1: what the release conditions read, for the handoff detail (never returned
+            # in a result; `summary` keeps its keys)
+            "group": group,
+            "rows": rows,
+            "covered": covered,
+            "dangling": dangling,
+            "eligible": eligible,
+            "profile_ok": group is not None and all(scores[name] >= t for name, t in group.items()),
+            "accepted": eligible
+            and group is not None
+            and all(scores[name] >= t for name, t in group.items()),
+        }
+
+    async def measure(self, question, evidence, draft, context, *, slots=None):
+        """Every signal for one draft, as a calibration record (without its label)."""
+        value = draft.model_dump(mode="json") if hasattr(draft, "model_dump") else draft
+        if slots is None:
+            text = question.text if hasattr(question, "text") else question["text"]
+            slots = await decompose(self.generator, text, context)
+        state = await self._assess(question, evidence, value, context, slots, everything=True)
+        if "blocked" in state:
+            return {"group": "other", "eligible": False, "scores": {}, "blocked": state["blocked"]}
+        return {
+            "group": state["kind"] or "other",
+            "eligible": state["eligible"],
+            "scores": state["scores"],
+        }
+
+    async def control(
+        self,
+        question,
+        evidence,
+        draft,
+        context,
+        *,
+        slots=None,
+        trail=None,
+        judgements=None,
+        recover=None,
+    ):
+        """`trail` (PROD-1, a dict only when the handoff packet or the decision cache records)
+        receives the judged draft, `detail` of its last assessment, its raw claim judgements and
+        the requested items; the result does not change. `judgements` and `recover` are the
+        decision cache's recheck (PROD-2): reuse the recorded claim judgements, and no recovery
+        (a rewrite would call the extractor)."""
+        value = draft.model_dump(mode="json") if hasattr(draft, "model_dump") else draft
+        if trail is not None:
+            trail["draft"] = value
+        result = {"status": "ABSTAIN", "text": "", "sentences": [], "missing": [], "action": None}
+        if not evidence:
+            return {**result, "reason": "no_active_evidence"}
+        text = question.text if hasattr(question, "text") else question["text"]
+        p = self.policy
+
+        async def decomposed():
+            if slots is not None or not (p.partial or p.closure_on_full):
+                return slots
+            return await decompose(self.generator, text, context)
+
+        # Requested items are needed by the closure and the partial fallback; asked once, early.
+        shared = asyncio.ensure_future(decomposed())
+        try:
+            state = await self._assess(
+                question, evidence, value, context, shared, judgements=judgements
+            )
+            if (p.recover if recover is None else recover) and not state.get("accepted"):
+                before = summary(state)
+                value, state, result["action"] = await self._recover(
+                    question, evidence, value, state, context, shared
+                )
+                if result["action"] is not None:
+                    result["assessment_before_recovery"] = before
+            result["assessment"] = summary(state)
+            result["conflict_signal"] = self.conflict_signal(state)
+            if trail is not None:
+                if result["action"] is not None and value != trail["draft"]:
+                    trail["draft_before_recovery"], trail["draft"] = trail["draft"], value
+                trail["control"] = detail(state, result["action"])
+                if "values" in state:
+                    trail["judgements"] = [state["values"][i] for i in range(len(state["claims"]))]
+                    trail["slots"] = state.get("slots")
+            if state.get("accepted"):
+                return {
+                    **result,
+                    "status": "FULL",
+                    "text": " ".join(s["text"] for s in value["sentences"]),
+                    "sentences": value["sentences"],
+                }
+            if "blocked" in state or not p.partial:
+                return {**result, "reason": state.get("blocked", "claim_verification_failed")}
+            partial = await self._partial(question, evidence, value, state, context)
+            if trail is not None:
+                trail["control"]["partial"] = {
+                    "status": partial.get("status"),
+                    "reason": partial.get("reason"),
+                    "missing": list(partial.get("missing") or []),
+                }
+            return {**result, **partial}
+        except ProviderError as exc:
+            if trail is not None:
+                trail["control"] = {"error": exc.code}
+            return {**result, "status": "ERROR", "reason": exc.code}
+        finally:
+            if not shared.done():
+                shared.cancel()
+
+    def conflict_signal(self, state):
+        """U12-c: the floor alone blocked this draft, and only because of conflict — the profile
+        passes, and every claim that is not SUPPORTED on the whole evidence carries a conflict
+        signal (CONFLICTING mass at the conflict floor, or SUPPORTED first with CONFLICTING
+        second short of the margin). Observation only unless an arm acts on it (N4)."""
+        if "labels" not in state or state.get("accepted") or not state.get("profile_ok"):
+            return False
+        gate, any_conflict = self.policy.gate, False
+        for i, verdict in enumerate(state["labels"]):
+            if verdict == "SUPPORTED":
+                continue
+            value = state["values"][i]
+            if value.get("form") != "choice" or "probabilities" not in value:
+                return False
+            p = value["probabilities"]
+            order = sorted(p, key=p.get, reverse=True)
+            conflict = (
+                verdict == "CONFLICTING"
+                or p.get("CONFLICTING", 0.0) >= gate["conflict_floor"]
+                or (
+                    len(order) > 1
+                    and order[0] == "SUPPORTED"
+                    and order[1] == "CONFLICTING"
+                    and verdict == "UNCERTAIN"
+                )
+            )
+            if not conflict:
+                return False
+            any_conflict = True
+        return any_conflict
+
+    async def conflict_check(self, question, evidence, draft, context):
+        """N4: a draft written in the conflict form, judged claim by claim on its cited units
+        alone (no sweep of the uncited ones — U12-c's D2). All SUPPORTED: PARTIAL, as a
+        `source_disagreement_report` when it states several values (never an answer to the
+        question) or a `verified_partial_answer` when it states one."""
+        value = draft.model_dump(mode="json")
+        ids = {e["id"] for e in evidence}
+        if any(not set(s.evidence_ids) <= ids for s in draft.sentences):
+            return {
+                "status": "ABSTAIN",
+                "text": "",
+                "sentences": [],
+                "missing": [],
+                "action": "conflict_rewrite",
+                "reason": "citation_id_not_active",
+            }
+        claims = [s.text for s in draft.sentences]
+        cited = [list(s.evidence_ids) for s in draft.sentences]
+        _, values = await self._judge(
+            context, question, evidence, claims, cited, self.policy.partial_form, "minimal", None
+        )
+        labels = [
+            label({k: v for k, v in values[i].items() if k != "sweep_r"}, **self.policy.gate)
+            for i in range(len(claims))
+        ]
+        supported = bool(claims) and all(v == "SUPPORTED" for v in labels)
+        several = " | " in draft.short_answer  # the conflict form joins disagreeing values
+        return {
+            "status": "PARTIAL" if supported else "ABSTAIN",
+            "reason": "conflicting_evidence" if supported else "conflict_rewrite_unsupported",
+            "text": " ".join(s["text"] for s in value["sentences"]) if supported else "",
+            "sentences": value["sentences"] if supported else [],
+            "missing": [],
+            "action": "conflict_rewrite",
+            "answer_kind": ("source_disagreement_report" if several else "verified_partial_answer")
+            if supported
+            else None,
+            "assessment": {"claims": claims, "labels": labels, "scope": "cited_units_no_sweep"},
+        }
+
+    async def _recover(self, question, evidence, value, state, context, slots):
+        """One bounded action; whatever it produces faces the same fixed gate again."""
+        p = self.policy
+        if state.get("blocked") == "missing_sentence_claims":
+            again = await self._assess(question, evidence, value, context, slots)
+            return value, again, "reextract"
+        if "blocked" in state:
+            return value, state, None
+        failed = sorted(
+            {
+                o
+                for o, v in zip(state["owner"], state["labels"], strict=True)
+                if o is not None and v != "SUPPORTED"
+            }
+        )
+        refuted = any(
+            refute_score(state["values"][i]) >= p.rewrite_refute_floor
+            for i, o in enumerate(state["owner"])
+            if o in failed
+        )
+        # A refuted sentence first; otherwise one that widened what its evidence says.
+        loose = [i for i, ok in enumerate(state["scoped"]) if not ok]
+        targets, action = (
+            (failed, "rewrite") if failed and refuted else (loose, "qualifier_rewrite")
+        )
+        if targets:
+            with node("recover:" + action, sorted(targets), attempt_kind="repair"):
+                new, _ = await rewrite_extractive(
+                    self.generator, question, evidence, value, targets, context
+                )
+            if new is None:
+                return value, state, action
+            fixed = new.model_dump(mode="json")
+            return fixed, await self._assess(question, evidence, fixed, context, slots), action
+        if p.path != "direct" and (state["checks"].get("coverage") or 0) < p.threshold:
+            again = await self._assess(
+                question, evidence, value, context, slots, previous=state["extraction"]
+            )
+            return value, again, "reextract"
+        return value, state, None
+
+    async def _partial(self, question, evidence, value, state, context):
+        p, slots, relations = self.policy, state["slots"], state["relations"]
+        if not slots:
+            return {"reason": "question_not_decomposed"}
+        if relations is None:
+            return {"reason": "slot_relations_unavailable"}
+        sentences = [s["text"] for s in value["sentences"]]
+        labels, _ = await self._judge(
+            context,
+            question,
+            evidence,
+            state["claims"],
+            state["cited"],
+            p.partial_form,
+            p.partial_scope,
+            None,
+        )
+        faithful = (
+            [1.0] * len(sentences)  # nothing was extracted, so there is no extraction to doubt
+            if p.path == "direct"
+            else await sentence_coverage(
+                Asker(self.decision, context), sentences, state["claims"], state["owner"]
+            )
+        )
+        good = [
+            i
+            for i in range(len(sentences))
+            if (faithful[i] or 0) >= p.threshold
+            and state["informative"][i]
+            and state["scoped"][i]
+            and any(o == i for o in state["owner"])
+            and all(v == "SUPPORTED" for o, v in zip(state["owner"], labels, strict=True) if o == i)
+        ]
+        output = compose(
+            sentences,
+            good,
+            relations,
+            slots,
+            partial=True,
+            answer_threshold=p.answer_threshold,
+            dependency_threshold=p.dependency_threshold,
+        )
+        return {
+            "status": output["status"],
+            "text": output["text"],
+            "sentences": [value["sentences"][i] for i in output["sentences"]],
+            # Unanswered requested items are always named, never silently dropped.
+            "missing": [slots[j]["ask"] for j in output["missing_slots"]],
+        }

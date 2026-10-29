@@ -1,0 +1,1 @@
+answer lists facts without settling question, or hedges between several answers.

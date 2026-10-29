@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:rvg:runtime-api:0.1:runtime_description",
+  "title": "RuntimeSession.describe_runtime result",
+  "description": "Identifiers without secrets: no credential, connection string, data path or document text. `install.source_commit` is null by design: the release manifest links a source commit to a wheel; the wheel does not name itself.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_version", "system_id", "distribution", "policy", "prompt_manifest_sha256", "schema_manifest_sha256", "schemas", "backend", "providers", "settings", "install"],
+  "properties": {
+    "api_version": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/api_version"},
+    "system_id": {"const": "rvg-runtime"},
+    "distribution": {
+      "type": "object", "additionalProperties": false, "required": ["name", "version"],
+      "properties": {"name": {"const": "rvg-runtime"}, "version": {"type": "string"}}
+    },
+    "policy": {
+      "type": "object", "additionalProperties": false, "required": ["id", "sha256", "semantic_sha256"],
+      "properties": {
+        "id": {"type": "string"},
+        "sha256": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/sha256"},
+        "semantic_sha256": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/sha256"}
+      }
+    },
+    "prompt_manifest_sha256": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/sha256"},
+    "schema_manifest_sha256": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/sha256"},
+    "schemas": {"type": "object", "additionalProperties": {"$ref": "urn:rvg:runtime-api:0.1:common#/$defs/sha256"}},
+    "backend": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state_store", "vector_index", "precision", "storage_fingerprint", "storage_config_hash"],
+      "properties": {
+        "state_store": {"type": "string"},
+        "vector_index": {"type": "string"},
+        "precision": {"type": "string"},
+        "storage_fingerprint": {"type": "string"},
+        "storage_config_hash": {"type": ["string", "null"]}
+      }
+    },
+    "providers": {
+      "type": "object", "additionalProperties": false,
+      "required": ["decision", "writer", "extractor", "embedding", "transport"],
+      "properties": {
+        "decision": {"$ref": "#/$defs/provider"},
+        "writer": {"$ref": "#/$defs/provider"},
+        "extractor": {"$ref": "#/$defs/provider"},
+        "embedding": {"$ref": "#/$defs/provider"},
+        "transport": {"enum": ["session", "caller"]}
+      }
+    },
+    "settings": {
+      "type": "object", "additionalProperties": false, "required": ["mode", "decision_provider"],
+      "properties": {"mode": {"type": ["string", "null"]}, "decision_provider": {"type": ["string", "null"]}}
+    },
+    "install": {
+      "type": "object", "additionalProperties": false, "required": ["module_origin", "editable", "source_commit", "dirty"],
+      "properties": {
+        "module_origin": {"type": "string"},
+        "editable": {"type": ["boolean", "null"]},
+        "source_commit": {"type": "null"},
+        "dirty": {"type": "null"}
+      }
+    }
+  },
+  "$defs": {
+    "provider": {
+      "type": "object", "additionalProperties": false, "required": ["role", "kind", "model_id", "network"],
+      "properties": {
+        "role": {"type": "string"},
+        "kind": {"type": ["string", "null"]},
+        "model_id": {"type": ["string", "null"]},
+        "network": {"enum": ["NONE", "EXTERNAL_API"]},
+        "space": {"type": "string"}
+      }
+    }
+  }
+}

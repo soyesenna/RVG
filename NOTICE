@@ -1,0 +1,15 @@
+rvg-runtime (RVG — Retrieval-Verified Generation)
+Copyright 2026 Jooyoung Kim
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This distribution contains no third-party source code or data. It depends on the following
+packages, which are installed separately and keep their own licenses:
+
+- httpx (BSD-3-Clause), numpy (BSD-3-Clause and bundled permissive licenses), pydantic and
+  pydantic-settings (MIT), and their dependencies (MIT, BSD-3-Clause, PSF-2.0, MPL-2.0 for certifi).
+- Optional extra "postgres": psycopg[binary] (LGPL-3.0-only). It is not bundled; installing the
+  extra fetches it from its own distribution under its own license.
+
+Model providers (the Jev judge, embedding models, the Claude Code CLI or other writers) are
+external services used under their own terms; no provider code or model is included.
