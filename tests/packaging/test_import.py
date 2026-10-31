@@ -29,7 +29,7 @@ def probe():
 
 
 def test_the_package_has_a_version_and_a_public_api():
-    assert rvg.__version__ == "0.1.0"
+    assert rvg.__version__ == "0.1.1"
     assert "UniversalEngine" in rvg.__all__ and "capabilities" in rvg.__all__
 
 

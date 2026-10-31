@@ -2,6 +2,16 @@
 
 API, storage schema, policy, prompt and backend-capability changes are listed separately.
 
+## 0.1.1 — documentation, 2026-10-31
+
+Documentation only: no code, API, storage schema, policy, prompt or backend-capability change.
+
+- **Citation.** The README cites the paper as the Zenodo preprint
+  ([doi:10.5281/zenodo.23796302](https://doi.org/10.5281/zenodo.23796302)). The 0.1.0 page on PyPI
+  still showed the earlier placeholder citation, and a PyPI page changes only with a new release.
+- **Links.** README links are absolute GitHub URLs at this release's tag, so they also work on the
+  PyPI project page.
+
 ## 0.1.0 — first public release, 2026-10-29
 
 The first public release of `rvg-runtime` (import `rvg`), the runtime of RVG — Retrieval-Verified

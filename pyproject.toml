@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 [project]
 # Distribution name on PyPI; the import name is `rvg`.
 name = "rvg-runtime"
-version = "0.1.0"
+version = "0.1.1"
 description = "Retrieval-Verified Generation (RVG): answers from permitted, in-force knowledge-base evidence under a release contract — a fixed controller releases only verified text (FULL or PARTIAL) and hands the rest off (ABSTAIN)"
 readme = "README.md"
 requires-python = ">=3.11"

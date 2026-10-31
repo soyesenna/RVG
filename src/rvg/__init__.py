@@ -5,7 +5,7 @@ writer, the fixed answer controller and one bounded cascade step — under one p
 knowledge base and language. Importing this package reads no file, opens no connection and
 creates no database: the public names (`rvg.api`) load on first use."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "API_VERSION",

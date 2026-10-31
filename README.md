@@ -1,7 +1,7 @@
 # RVG — Retrieval-Verified Generation
 
 [![CI](https://github.com/soyesenna/RVG/actions/workflows/ci.yml/badge.svg)](https://github.com/soyesenna/RVG/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/soyesenna/RVG/blob/v0.1.1/LICENSE)
 
 `rvg-runtime` (import name `rvg`) answers questions from an institution's own knowledge base under a
 **release contract: attribute or hand off.** A writer drafts an answer from documents the asker may
@@ -11,12 +11,12 @@ against the cited evidence with a judge model. Only what the evidence supports i
 One policy file serves every knowledge base and language — no per-KB thresholds, profiles,
 retrieval settings or human calibration.
 
-Korean README: [README.ko.md](README.ko.md).
+Korean README: [README.ko.md](https://github.com/soyesenna/RVG/blob/v0.1.1/README.ko.md).
 
 > **About this repository.** RVG was developed and measured in a private research repository
 > (September to October 2026, development versions 0.1.0.dev0 to 0.1.0.dev58). This public
 > repository holds release snapshots, so its history starts with the 0.1.0 release commit; the
-> development steps are summarized in [CHANGELOG.md](CHANGELOG.md). Paper:
+> development steps are summarized in [CHANGELOG.md](https://github.com/soyesenna/RVG/blob/v0.1.1/CHANGELOG.md). Paper:
 > [doi:10.5281/zenodo.23796302](https://doi.org/10.5281/zenodo.23796302).
 
 ## What it guarantees, and what it does not
@@ -37,7 +37,7 @@ Structural guarantees (enforced by code, kept by the test suite):
   any CPU or BLAS.
 
 Measured properties (a fixed model combination, measured in a private research repository —
-see [docs/GUARANTEES.md](docs/GUARANTEES.md) for every number, its sample and caveats):
+see [docs/GUARANTEES.md](https://github.com/soyesenna/RVG/blob/v0.1.1/docs/GUARANTEES.md) for every number, its sample and caveats):
 
 - On real Wikipedia revisions, RVG released no superseded value as current (0 of 150 releases).
   The same model, given the revision dates and the validity rule in its prompt, also reached 0;
@@ -50,7 +50,7 @@ see [docs/GUARANTEES.md](docs/GUARANTEES.md) for every number, its sample and ca
 
 What it does **not** guarantee: correctness of the model outputs themselves, behaviour with other
 writer/judge/embedding models than the ones measured, group-membership changes during a release,
-or writes that bypass the state store. See [docs/capabilities.md](docs/capabilities.md) for the
+or writes that bypass the state store. See [docs/capabilities.md](https://github.com/soyesenna/RVG/blob/v0.1.1/docs/capabilities.md) for the
 verification level of every component.
 
 ## Install
@@ -64,7 +64,7 @@ Python 3.11 or newer.
 
 ## A 60-second example (no network, no keys)
 
-[`examples/api/public_consumer.py`](examples/api/public_consumer.py) runs every public operation
+[`examples/api/public_consumer.py`](https://github.com/soyesenna/RVG/blob/v0.1.1/examples/api/public_consumer.py) runs every public operation
 against a fresh SQLite store with a deterministic, offline stand-in for the model provider:
 
 ```bash
@@ -97,7 +97,7 @@ model answers.
 
 RVG talks to three model roles. Secrets come from environment variables (or arguments you pass);
 nothing is read from files unless you use the standalone loader `rvg.load_settings(root)`, which
-also reads `root/.env`. See [.env.example](.env.example) for every setting.
+also reads `root/.env`. See [.env.example](https://github.com/soyesenna/RVG/blob/v0.1.1/.env.example) for every setting.
 
 | Role | Default | Setting |
 |---|---|---|
@@ -120,11 +120,11 @@ async with rvg.open_session("storage.json", settings) as session:
 Command line: `rvg ingest documents.jsonl --storage storage.json` (documents, access lists and
 events, one JSON object per line, then embeddings), `rvg universal-query "question" --storage
 storage.json --principal alice --group staff`, `rvg policy`, `rvg capabilities`; `rvg --help`.
-Storage configurations: [examples/storage](examples/storage) (SQLite, PostgreSQL + pgvector;
+Storage configurations: [examples/storage](https://github.com/soyesenna/RVG/tree/v0.1.1/examples/storage) (SQLite, PostgreSQL + pgvector;
 Qdrant through its REST API). To rank vectors you already have in place (float16), write an
 external vector set with `rvg.write_external_set` (or `rvg.export_external_set` from a state
-store) and set `vectors.source: external_float16`: [docs/external-vectors.md](docs/external-vectors.md),
-example [examples/storage/external_float16.py](examples/storage/external_float16.py).
+store) and set `vectors.source: external_float16`: [docs/external-vectors.md](https://github.com/soyesenna/RVG/blob/v0.1.1/docs/external-vectors.md),
+example [examples/storage/external_float16.py](https://github.com/soyesenna/RVG/blob/v0.1.1/examples/storage/external_float16.py).
 
 ## Opt-in features
 
@@ -143,7 +143,7 @@ All are off by default and do not change the policy or settings hashes.
   (probability ≥ `theta`). No writer call; the draft is judged again for the new question on the
   current evidence, so revoked, hidden or no longer valid units are never reused. The release
   record says so (`source.cache`). Operating points (θ 0.95 / 0.9) and the measured limits are in
-  [docs/GUARANTEES.md](docs/GUARANTEES.md) §6.
+  [docs/GUARANTEES.md](https://github.com/soyesenna/RVG/blob/v0.1.1/docs/GUARANTEES.md) §6.
 - **Candidate stage** — storage `"vectors": {"candidate_stage": "turboquant_mse4"}` (local exact):
   4-bit TurboQuant codes propose candidates, the exact vectors rank them. Build the codes after
   loading, with `await rvg.build_candidate_codes(storage, tenant, space)` (`space`: the
@@ -160,7 +160,7 @@ All are off by default and do not change the policy or settings hashes.
 
 ## Repository layout
 
-- `src/rvg` — the package. Public names are `rvg.__all__` ([docs/api/PUBLIC_API.md](docs/api/PUBLIC_API.md)).
+- `src/rvg` — the package. Public names are `rvg.__all__` ([docs/api/PUBLIC_API.md](https://github.com/soyesenna/RVG/blob/v0.1.1/docs/api/PUBLIC_API.md)).
   The single policy is `src/rvg/resources/policies/universal.json`; prompts and JSON schemas are
   package resources.
 - `tests` — the test suite (no network; PostgreSQL, pgvector and Qdrant tests run when
@@ -191,8 +191,8 @@ uv run pytest -q
 uv build && uv run python scripts/check_dist.py dist/*.whl dist/*.tar.gz
 ```
 
-Contributing: [CONTRIBUTING.md](CONTRIBUTING.md). Security: [SECURITY.md](SECURITY.md).
-Changes: [CHANGELOG.md](CHANGELOG.md). Releasing: [docs/RELEASING.md](docs/RELEASING.md).
+Contributing: [CONTRIBUTING.md](https://github.com/soyesenna/RVG/blob/v0.1.1/CONTRIBUTING.md). Security: [SECURITY.md](https://github.com/soyesenna/RVG/blob/v0.1.1/SECURITY.md).
+Changes: [CHANGELOG.md](https://github.com/soyesenna/RVG/blob/v0.1.1/CHANGELOG.md). Releasing: [docs/RELEASING.md](https://github.com/soyesenna/RVG/blob/v0.1.1/docs/RELEASING.md).
 
 ## Citation
 
@@ -217,4 +217,4 @@ The released software `rvg-runtime` 0.1.0 is archived on Zenodo as
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache License 2.0 — see [LICENSE](https://github.com/soyesenna/RVG/blob/v0.1.1/LICENSE) and [NOTICE](https://github.com/soyesenna/RVG/blob/v0.1.1/NOTICE).
