@@ -6,6 +6,8 @@
 
 이 저장소는 연구 저장소(Deep Jev)에서 **동작을 보존해 분리한** runtime이다. 연구·평가·자료·보고서는 연구 저장소에 남는다. 분리했다고 정확성·보안·로컬 실행이 새로 인증된 것은 아니다.
 
+> **이 저장소에 대하여.** RVG는 비공개 연구 저장소에서 2026년 9월부터 10월까지 개발하고 측정했다(개발 버전 0.1.0.dev0 ~ 0.1.0.dev58). 이 공개 저장소는 릴리스 스냅샷만 담으므로 이력이 0.1.0 공개 커밋에서 시작한다. 개발 단계 요약은 [CHANGELOG.md](CHANGELOG.md)에 있다. 논문: [doi:10.5281/zenodo.23796302](https://doi.org/10.5281/zenodo.23796302).
+
 ## 설치
 
 ```bash
@@ -78,4 +80,4 @@ uv build --out-dir dist && uv run python scripts/check_dist.py dist/*.whl dist/*
 - [이관 기록](docs/migrations/0001-initial-extraction.ko.md)(영어 정본 [0001-initial-extraction.md](docs/migrations/0001-initial-extraction.md))
 - [보안(한국어 요약)](SECURITY.ko.md)(영어 정본 [SECURITY.md](SECURITY.md)), [릴리스 절차(한국어 요약)](docs/RELEASING.ko.md)(영어 정본 [RELEASING.md](docs/RELEASING.md)), [변경 이력](CHANGELOG.md)
 
-라이선스는 Apache-2.0이다([LICENSE](LICENSE), [NOTICE](NOTICE)). 측정 근거 보고서는 비공개 연구 저장소에 있고, 논문(TechRxiv)으로 공개할 예정이다.
+라이선스는 Apache-2.0이다([LICENSE](LICENSE), [NOTICE](NOTICE)). 측정 근거 보고서는 비공개 연구 저장소에 있고, 주요 측정은 논문(Zenodo 프리프린트, [doi:10.5281/zenodo.23796302](https://doi.org/10.5281/zenodo.23796302))에 실었다. 인용 BibTeX는 영어 README의 [Citation](README.md#citation)에 있다.

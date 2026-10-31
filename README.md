@@ -13,6 +13,12 @@ retrieval settings or human calibration.
 
 Korean README: [README.ko.md](README.ko.md).
 
+> **About this repository.** RVG was developed and measured in a private research repository
+> (September to October 2026, development versions 0.1.0.dev0 to 0.1.0.dev58). This public
+> repository holds release snapshots, so its history starts with the 0.1.0 release commit; the
+> development steps are summarized in [CHANGELOG.md](CHANGELOG.md). Paper:
+> [doi:10.5281/zenodo.23796302](https://doi.org/10.5281/zenodo.23796302).
+
 ## What it guarantees, and what it does not
 
 Structural guarantees (enforced by code, kept by the test suite):
@@ -173,7 +179,8 @@ summaries of the security and release policies (`SECURITY.ko.md`, `docs/RELEASIN
 English text is canonical, and `scripts/check_doc_numbers.py` checks that each translation carries
 the same numbers. The documents cite reports of the private research repository in
 which RVG was developed and measured ("private research repository report `docs/...`", or an
-experiment ID). Those reports are not public; the measurements will be released with the paper.
+experiment ID). Those reports are not public; the main measurements are reported in the paper
+(see [Citation](#citation)).
 RVG was developed by Jooyoung Kim (independent researcher).
 
 ## Development
@@ -189,16 +196,24 @@ Changes: [CHANGELOG.md](CHANGELOG.md). Releasing: [docs/RELEASING.md](docs/RELEA
 
 ## Citation
 
-If you use RVG, please cite the paper (TechRxiv preprint; DOI to be added):
+If you use RVG, please cite the paper (preprint on Zenodo,
+[doi:10.5281/zenodo.23796302](https://doi.org/10.5281/zenodo.23796302)):
 
 ```bibtex
-@misc{rvg2026,
-  title  = {Retrieval-Verified Generation: A Release Contract for Retrieval-Augmented Answering},
-  author = {Kim, Jooyoung},
-  year   = {2026},
-  note   = {TechRxiv preprint, DOI to be added}
+@misc{kim_2026_23796302,
+  author    = {Kim, Jooyoung},
+  title     = {Retrieval-Verified Generation: A Release Contract for Retrieval-Augmented Answering},
+  month     = oct,
+  year      = 2026,
+  publisher = {Zenodo},
+  version   = 1,
+  doi       = {10.5281/zenodo.23796302},
+  url       = {https://doi.org/10.5281/zenodo.23796302}
 }
 ```
+
+The released software `rvg-runtime` 0.1.0 is archived on Zenodo as
+[doi:10.5281/zenodo.23796304](https://doi.org/10.5281/zenodo.23796304).
 
 ## License
 
